@@ -1,152 +1,119 @@
-# Deploying PuckServerTracker on a Linux VPS
+# Deploying PuckServerTracker on Ubuntu VPS
 
 ## Prerequisites
-- Dummy Steam account that **owns Puck** (AppID 2994020)
-- Linux VPS with at least 1GB RAM (Ubuntu/Debian recommended)
 
-## 1. Install Steam Client
+- Ubuntu VPS (20.04+)
+- Steam account that owns Puck (free-to-play, AppID 2994020)
+- PostgreSQL database with the `psl_` tables created (run `migrations/003_puck_server_list.sql`)
+
+## 1. Publish (on your Windows dev machine)
 
 ```bash
-# Enable 32-bit arch (Steam needs it)
-sudo dpkg --add-architecture i386
-sudo apt update
-
-# Install Steam
-sudo apt install -y steam steamcmd
-
-# Or manually:
-# wget https://cdn.cloudflare.steamstatic.com/client/installer/steam.deb
-# sudo dpkg -i steam.deb
-# sudo apt-get install -f -y
+cd "C:/Projects/Puck Plugins/PuckServerTracker/PuckTracker"
+dotnet publish -r linux-x64 --self-contained -o publish/linux-x64
 ```
 
-## 2. Set up headless Steam (no GUI needed)
+This creates a self-contained binary — no .NET install needed on the VPS.
+
+## 2. Upload to VPS
 
 ```bash
-# Create a steam user (don't run Steam as root)
-sudo useradd -m -s /bin/bash steamuser
-sudo su - steamuser
-
-# Log in via SteamCMD first to cache credentials
-steamcmd +login YOUR_DUMMY_USERNAME YOUR_PASSWORD +quit
-
-# Install Puck dedicated server (free, gets us the steam libraries)
-steamcmd +login YOUR_DUMMY_USERNAME +app_update 3004430 +quit
+scp -r PuckTracker/publish/linux-x64/ user@your-vps:~/pucktracker/
+scp PuckTracker/GeoLite2-City.mmdb PuckTracker/GeoLite2-ASN.mmdb user@your-vps:~/pucktracker/
 ```
 
-Note: The dummy account needs to own Puck. If Puck is free-to-play, just
-"install" it to the account via Steam. If paid, buy it on the dummy account.
-
-## 3. Install .NET 9 Runtime
+## 3. Configure
 
 ```bash
-# Ubuntu/Debian
-wget https://dot.net/v1/dotnet-install.sh
-chmod +x dotnet-install.sh
-./dotnet-install.sh --runtime dotnet --version 9.0.0
-echo 'export PATH=$PATH:$HOME/.dotnet' >> ~/.bashrc
-source ~/.bashrc
-```
-
-Or use the self-contained publish (no .NET install needed) - the published
-binary already includes the runtime.
-
-## 4. Deploy PuckTracker
-
-```bash
-# Upload the publish/linux-x64/ folder to your VPS
-# e.g. via scp:
-scp -r publish/linux-x64/ user@your-vps:/home/steamuser/PuckTracker/
-
-# On the VPS:
-sudo su - steamuser
-cd ~/PuckTracker
+ssh user@your-vps
+cd ~/pucktracker
 chmod +x PuckTracker
 
-# The Steam client's libsteam_api.so needs to be findable.
-# Link or copy it from the Steam installation:
-ln -s ~/.steam/steam/linux64/libsteam_api.so ./libsteam_api.so
-# or from the dedicated server:
-# ln -s ~/Steam/steamapps/common/Puck\ Dedicated\ Server/Puck_Data/Plugins/x86_64/libsteam_api.so ./libsteam_api.so
-
-# Make sure steam_appid.txt is present (should be in the folder already)
-cat steam_appid.txt  # should show: 2994020
+# Create .env
+cat > .env << 'EOF'
+DATABASE_URL=postgresql://user:pass@host:port/dbname
+EOF
 ```
 
-## 5. Run Steam Client in Background
+## 4. First run (interactive)
 
-The tracker needs the Steam client running (not just SteamCMD) because
-it calls `SteamUser.GetAuthTicketForWebApi()` which requires a full client
-session.
+The first run requires interactive input for Steam login:
 
 ```bash
-# Install virtual framebuffer for headless operation
-sudo apt install -y xvfb
-
-# Start Steam headless
-export DISPLAY=:99
-Xvfb :99 -screen 0 1024x768x24 &
-steam -no-browser -no-dwrite -silent &
-
-# Wait for Steam to start up (check with):
-sleep 10
-```
-
-Alternative: if the full Steam client is too heavy, you may be able to use
-the Steam runtime libraries directly. The key file needed is `libsteam_api.so`
-and Steam must be running for auth tickets to work.
-
-## 6. Run PuckTracker
-
-```bash
-cd ~/PuckTracker
-
-# Test single scan first
 ./PuckTracker --once
-
-# Run continuously (every 5 minutes by default)
-./PuckTracker
-
-# Run as a background service with systemd (recommended):
 ```
 
-## 7. Systemd Service (optional, recommended)
+You'll be prompted for:
 
-Create `/etc/systemd/system/pucktracker.service`:
+1. Steam username
+2. Steam password (hidden input)
+3. Steam Guard code (email or authenticator)
 
-```ini
+After successful login, a `steam_credentials.json` file is saved with a refresh
+token. All future runs authenticate automatically without prompting.
+
+## 5. Set up systemd service
+
+```bash
+sudo tee /etc/systemd/system/pucktracker.service > /dev/null << 'EOF'
 [Unit]
 Description=Puck Server Tracker
 After=network.target
 
 [Service]
 Type=simple
-User=steamuser
-WorkingDirectory=/home/steamuser/PuckTracker
-ExecStart=/home/steamuser/PuckTracker/PuckTracker
+User=YOUR_USER
+WorkingDirectory=/root/PuckTracker
+ExecStart=/root/PuckTracker/PuckTracker
 Restart=always
 RestartSec=30
-Environment=LD_LIBRARY_PATH=/home/steamuser/PuckTracker
 
 [Install]
 WantedBy=multi-user.target
-```
+EOF
 
-Then:
-```bash
 sudo systemctl daemon-reload
 sudo systemctl enable pucktracker
 sudo systemctl start pucktracker
-sudo journalctl -u pucktracker -f  # watch logs
 ```
+
+## 6. Monitor
+
+```bash
+# Watch live logs
+sudo journalctl -u pucktracker -f
+
+# Check status
+sudo systemctl status pucktracker
+
+# Restart after updating
+sudo systemctl restart pucktracker
+```
+
+## Updating
+
+To deploy a new version:
+
+```bash
+# On Windows: rebuild
+dotnet publish -r linux-x64 --self-contained -o publish/linux-x64
+
+# Upload new binary
+scp PuckTracker/publish/linux-x64/PuckTracker user@your-vps:~/pucktracker/PuckTracker
+
+# Restart on VPS
+ssh user@your-vps "sudo systemctl restart pucktracker"
+```
+
+The `.env`, `steam_credentials.json`, and `.mmdb` files persist between updates.
 
 ## Troubleshooting
 
-- **SteamAPI.Init() failed**: Steam client isn't running, or steam_appid.txt
-  is missing, or the account doesn't own Puck
-- **libsteam_api.so not found**: Set `LD_LIBRARY_PATH` to include the dir
-  with the .so file, or copy/symlink it next to the PuckTracker binary
-- **Auth ticket failed**: Steam session expired, restart Steam client
-- **Connection refused to puck1**: The b202 master server has an expired SSL
-  cert - the app bypasses this, but your VPS firewall might block outbound
-  port 443
+- **SteamAPI login failed**: Delete `steam_credentials.json` and run interactively
+  again to re-authenticate
+- **Database connection failed**: Check `DATABASE_URL` in `.env`
+- **b202 connection fails**: The b202 master server (`puck1.nasejevs.com`) has an
+  expired SSL cert. The app bypasses this automatically, but some firewalls may
+  block it
+- **No servers found**: Make sure the `psl_` tables exist in PostgreSQL
+  (run the migration)
