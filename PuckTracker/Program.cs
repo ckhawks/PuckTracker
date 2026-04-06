@@ -10,9 +10,28 @@ const uint PUCK_APP_ID = 2994020;
 const int POLL_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 bool runOnce = args.Contains("--once");
 
+// --- Load .env file if present ---
+var envPath = Path.Combine(AppContext.BaseDirectory, ".env");
+if (!File.Exists(envPath))
+    envPath = Path.Combine(Directory.GetCurrentDirectory(), ".env");
+if (File.Exists(envPath))
+{
+    foreach (var line in File.ReadAllLines(envPath))
+    {
+        var trimmed = line.Trim();
+        if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith('#')) continue;
+        var eq = trimmed.IndexOf('=');
+        if (eq <= 0) continue;
+        var key = trimmed[..eq].Trim();
+        var val = trimmed[(eq + 1)..].Trim();
+        if (Environment.GetEnvironmentVariable(key) == null)
+            Environment.SetEnvironmentVariable(key, val);
+    }
+}
+
 // --- PostgreSQL Init ---
 var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL")
-    ?? throw new Exception("DATABASE_URL environment variable is required");
+    ?? throw new Exception("DATABASE_URL environment variable is required. Set it or create a .env file.");
 var connStr = databaseUrl;
 // Handle postgres:// URL format (convert to Npgsql connection string if needed)
 if (connStr.StartsWith("postgres://") || connStr.StartsWith("postgresql://"))
@@ -337,7 +356,7 @@ async Task SaveSnapshot(NpgsqlDataSource db, string version, List<ServerInfo> se
                 game_version = EXCLUDED.game_version, last_seen = EXCLUDED.last_seen
             RETURNING id", conn, txn);
         upsertServer.Parameters.AddWithValue(s.IpAddress);
-        upsertServer.Parameters.AddWithValue(s.Port);
+        upsertServer.Parameters.AddWithValue((int)s.Port);
         upsertServer.Parameters.AddWithValue((object?)s.Country ?? DBNull.Value);
         upsertServer.Parameters.AddWithValue((object?)s.Region ?? DBNull.Value);
         upsertServer.Parameters.AddWithValue((object?)s.City ?? DBNull.Value);

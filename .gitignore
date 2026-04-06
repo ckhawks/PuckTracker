@@ -7,3 +7,5 @@ data/
 *.db
 .vs/
 *.user
+.env
+steam_credentials.json
