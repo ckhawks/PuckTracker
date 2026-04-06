@@ -1,0 +1,16 @@
+{
+  "name": "puck-server-tracker",
+  "version": "1.0.0",
+  "description": "Standalone server population tracker for Puck (b202 + b312)",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "once": "node src/index.js --once"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "geoip-lite": "^1.4.10",
+    "socket.io-client": "^4.7.5"
+  }
+}

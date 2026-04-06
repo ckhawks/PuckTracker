@@ -1,0 +1,9 @@
+bin/
+obj/
+publish/
+node_modules/
+data/
+*.mmdb
+*.db
+.vs/
+*.user

@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MaxMind.GeoIP2" Version="5.4.1" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.5" />
+    <PackageReference Include="SocketIOClient" Version="3.1.1" />
+  </ItemGroup>
+
+  <!-- Windows: use game's own Steamworks.NET (compatible with game's newer steam_api64.dll) -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == '' OR $([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))">
+    <Reference Include="com.rlabrecque.steamworks.net" Condition="'$(RuntimeIdentifier)' == '' OR '$(RuntimeIdentifier)' == 'win-x64'">
+      <HintPath>$(ProgramFiles) (x86)\Steam\steamapps\common\Puck\Puck_Data\Managed\com.rlabrecque.steamworks.net.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <None Include="$(ProgramFiles) (x86)\Steam\steamapps\common\Puck\Puck_Data\Plugins\x86_64\steam_api64.dll"
+          CopyToOutputDirectory="Always" Link="steam_api64.dll"
+          Condition="'$(RuntimeIdentifier)' == '' OR '$(RuntimeIdentifier)' == 'win-x64'" />
+  </ItemGroup>
+
+  <!-- Linux: use NuGet Steamworks.NET (works with Steam client's libsteam_api.so) -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-x64'">
+    <PackageReference Include="Steamworks.NET" Version="20.2.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="steam_appid.txt" CopyToOutputDirectory="Always" />
+    <None Include="GeoLite2-City.mmdb" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="GeoLite2-ASN.mmdb" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
