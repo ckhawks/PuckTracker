@@ -283,6 +283,15 @@ void EnrichWithGeoIP(List<ServerInfo> servers)
                 }
             }
             catch { }
+
+            // ISP-based country overrides (GeoIP misattributions)
+            if (s.Isp == "Ondrej Vrana")
+            {
+                s.Country = "CZ";
+                s.City = "Czechia";
+                s.Lat = 49.8175;
+                s.Lon = 15.4730;
+            }
         }
     }
     finally
@@ -436,7 +445,10 @@ async Task SaveSnapshot(NpgsqlDataSource db, string version, List<ServerInfo> se
 // Utilities
 // =============================================================================
 string StripRichText(string text) =>
-    Regex.Replace(text, @"<\/?[a-zA-Z][^>]*>", "").Trim();
+    Regex.Replace(
+        Regex.Replace(text, @"<#[0-9a-fA-F]{6,8}>", ""), // <#FFD700> style
+        @"<\/?[a-zA-Z][^>]*>", "" // <b>, <color=...>, </color> style
+    ).Trim();
 
 // =============================================================================
 // Data Model
