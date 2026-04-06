@@ -1,36 +1,44 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using Microsoft.Data.Sqlite;
-using Steamworks;
+using Npgsql;
 using SocketIOClient;
+using SteamKit2;
+using SteamKit2.Authentication;
 using SioClient = SocketIOClient.SocketIO;
 
-const int POLL_INTERVAL_MS = 1 * 60 * 1000; // 1 minute (testing)
+const uint PUCK_APP_ID = 2994020;
+const int POLL_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 bool runOnce = args.Contains("--once");
 
-// --- Steam Init ---
-Console.WriteLine("[Steam] Initializing Steamworks...");
-if (!SteamAPI.Init())
+// --- PostgreSQL Init ---
+var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL")
+    ?? throw new Exception("DATABASE_URL environment variable is required");
+var connStr = databaseUrl;
+// Handle postgres:// URL format (convert to Npgsql connection string if needed)
+if (connStr.StartsWith("postgres://") || connStr.StartsWith("postgresql://"))
 {
-    Console.Error.WriteLine("[Steam] SteamAPI.Init() failed. Is Steam running? Do you own Puck (AppId 2994020)?");
+    var uri = new Uri(connStr);
+    var userInfo = uri.UserInfo.Split(':');
+    connStr = $"Host={uri.Host};Port={uri.Port};Database={uri.AbsolutePath.TrimStart('/')};Username={userInfo[0]};Password={userInfo[1]};SSL Mode=Require;Trust Server Certificate=true";
+}
+var db = NpgsqlDataSource.Create(connStr);
+Console.WriteLine($"[DB] Connected to PostgreSQL");
+
+// --- Steam Login via SteamKit2 ---
+var steamSession = new SteamSession();
+await steamSession.Login();
+
+if (!steamSession.IsLoggedIn)
+{
+    Console.Error.WriteLine("[Steam] Login failed.");
     return 1;
 }
-Console.WriteLine($"[Steam] Initialized. Logged in as: {SteamFriends.GetPersonaName()} ({SteamUser.GetSteamID()})");
 
-// --- SQLite Init ---
-var dbPath = Path.Combine(AppContext.BaseDirectory, "data", "servers.db");
-Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
-using var db = new SqliteConnection($"Data Source={dbPath}");
-db.Open();
-InitializeDatabase(db);
-Console.WriteLine($"[DB] Database at {dbPath}");
-
-// --- Get initial auth ticket ---
-string? ticket = await GetAuthTicket();
+// --- Get auth ticket ---
+string? ticket = await steamSession.GetAuthTicket(PUCK_APP_ID);
 if (ticket == null)
 {
     Console.Error.WriteLine("[Steam] Failed to get auth ticket");
-    SteamAPI.Shutdown();
     return 1;
 }
 Console.WriteLine($"[Steam] Got auth ticket ({ticket.Length / 2} bytes)");
@@ -39,25 +47,24 @@ Console.WriteLine($"[Steam] Got auth ticket ({ticket.Length / 2} bytes)");
 var b202Conn = new PersistentConnection("b202", "wss://puck1.nasejevs.com", ticket);
 var b312Conn = new PersistentConnection("b312", "wss://puck2.nasejevs.com", ticket);
 
-Console.WriteLine($"PuckServerTracker started (mode: {(runOnce ? "single scan" : "continuous, every 1 min")})");
+Console.WriteLine($"PuckServerTracker started (mode: {(runOnce ? "single scan" : "continuous, every 15 min")})");
 
-// --- Connect both ---
 await Task.WhenAll(b202Conn.EnsureConnected(), b312Conn.EnsureConnected());
 
 try
 {
     do
     {
-        SteamAPI.RunCallbacks();
+        steamSession.RunCallbacks();
         await Scan(db, b202Conn, b312Conn);
 
         if (!runOnce)
         {
-            Console.WriteLine($"\nNext scan in 1 minute... (press Ctrl+C to exit)");
+            Console.WriteLine($"\nNext scan in 15 minutes... (press Ctrl+C to exit)");
             for (int i = 0; i < POLL_INTERVAL_MS / 1000; i++)
             {
                 await Task.Delay(1000);
-                SteamAPI.RunCallbacks();
+                steamSession.RunCallbacks();
             }
         }
     } while (!runOnce);
@@ -66,78 +73,46 @@ finally
 {
     await b202Conn.Disconnect();
     await b312Conn.Disconnect();
-    SteamAPI.Shutdown();
-    Console.WriteLine("[Steam] Shutdown.");
+    steamSession.Disconnect();
+    Console.WriteLine("[Steam] Disconnected.");
 }
 
 return 0;
 
 // =============================================================================
-// Scan - uses persistent connections, reconnects if needed
+// Scan
 // =============================================================================
-async Task Scan(SqliteConnection db, PersistentConnection b202, PersistentConnection b312)
+async Task Scan(NpgsqlDataSource db, PersistentConnection b202, PersistentConnection b312)
 {
     var timestamp = DateTime.UtcNow.ToString("o");
     Console.WriteLine($"\n{"".PadRight(60, '=')}");
     Console.WriteLine($"Scan at {timestamp}");
     Console.WriteLine("".PadRight(60, '='));
 
-    // Ensure both are connected (reconnects if dropped)
     await Task.WhenAll(b202.EnsureConnected(), b312.EnsureConnected());
 
-    // Query both in parallel
     var b202Task = b202.RequestServerList("playerGetServerBrowserServersRequest", ParseB202Response);
     var b312Task = b312.RequestServerList("playerGetServerBrowserEndPointsRequest", ParseB312Response);
 
     await Task.WhenAll(b202Task, b312Task);
 
-    // Process results sequentially (SQLite)
     await ProcessResult("b202", b202Task, db, timestamp);
     await ProcessResult("b312", b312Task, db, timestamp);
 }
 
-async Task ProcessResult(string version, Task<List<ServerInfo>> task, SqliteConnection db, string timestamp)
+async Task ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlDataSource db, string timestamp)
 {
     try
     {
         var servers = await task;
         EnrichWithGeoIP(servers);
         PrintServers(version, servers);
-        SaveSnapshot(db, version, servers, timestamp);
+        await SaveSnapshot(db, version, servers, timestamp);
     }
     catch (Exception ex)
     {
         Console.Error.WriteLine($"[{version}] Failed: {ex.Message}");
     }
-}
-
-// =============================================================================
-// Steam Auth
-// =============================================================================
-async Task<string?> GetAuthTicket()
-{
-    var tcs = new TaskCompletionSource<string?>();
-
-    Callback<GetTicketForWebApiResponse_t>.Create(response =>
-    {
-        var ticketBytes = response.m_rgubTicket;
-        var hex = BitConverter.ToString(ticketBytes, 0, ticketBytes.Length).Replace("-", "");
-        tcs.TrySetResult(hex);
-    });
-
-    SteamUser.GetAuthTicketForWebApi(null);
-
-    var deadline = DateTime.UtcNow.AddSeconds(10);
-    while (!tcs.Task.IsCompleted && DateTime.UtcNow < deadline)
-    {
-        SteamAPI.RunCallbacks();
-        await Task.Delay(50);
-    }
-
-    if (!tcs.Task.IsCompleted)
-        tcs.TrySetResult(null);
-
-    return await tcs.Task;
 }
 
 // =============================================================================
@@ -210,7 +185,6 @@ async Task<List<ServerInfo>> ParseB312Response(SocketIOResponse response)
         });
     }
 
-    // TCP preview each endpoint to get server details
     Console.WriteLine($"[b312] Fetching TCP previews for {endpoints.Count} endpoints...");
     await Task.WhenAll(endpoints.Select(TcpPreview));
     Console.WriteLine($"[b312] Parsed {endpoints.Count} servers");
@@ -334,76 +308,108 @@ void PrintServers(string version, List<ServerInfo> servers)
 }
 
 // =============================================================================
-// SQLite
+// PostgreSQL (psl_ tables)
 // =============================================================================
-void InitializeDatabase(SqliteConnection db)
+async Task SaveSnapshot(NpgsqlDataSource db, string version, List<ServerInfo> servers, string timestamp)
 {
-    using var cmd = db.CreateCommand();
-    cmd.CommandText = @"
-        CREATE TABLE IF NOT EXISTS snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            version TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS servers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
-            ip_address TEXT NOT NULL,
-            port INTEGER NOT NULL,
-            name TEXT,
-            raw_name TEXT,
-            players INTEGER,
-            max_players INTEGER,
-            is_password_protected INTEGER DEFAULT 0,
-            country TEXT, region TEXT, city TEXT,
-            lat REAL, lon REAL,
-            isp TEXT,
-            client_required_mod_ids TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_servers_snapshot ON servers(snapshot_id);
-        CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON snapshots(timestamp);
-    ";
-    cmd.ExecuteNonQuery();
-}
+    await using var conn = await db.OpenConnectionAsync();
+    await using var txn = await conn.BeginTransactionAsync();
 
-void SaveSnapshot(SqliteConnection db, string version, List<ServerInfo> servers, string timestamp)
-{
-    using var txn = db.BeginTransaction();
-
-    using var insertSnapshot = db.CreateCommand();
-    insertSnapshot.CommandText = "INSERT INTO snapshots (timestamp, version) VALUES ($ts, $ver); SELECT last_insert_rowid();";
-    insertSnapshot.Parameters.AddWithValue("$ts", timestamp);
-    insertSnapshot.Parameters.AddWithValue("$ver", version);
-    var snapshotId = (long)insertSnapshot.ExecuteScalar()!;
+    // Create snapshot
+    await using var insertSnapshot = new NpgsqlCommand(
+        "INSERT INTO psl_snapshots (timestamp, version) VALUES ($1, $2) RETURNING id", conn, txn);
+    insertSnapshot.Parameters.AddWithValue(DateTime.Parse(timestamp).ToUniversalTime());
+    insertSnapshot.Parameters.AddWithValue(version);
+    var snapshotId = (int)(await insertSnapshot.ExecuteScalarAsync())!;
 
     foreach (var s in servers)
     {
-        using var ins = db.CreateCommand();
-        ins.CommandText = @"
-            INSERT INTO servers (snapshot_id, ip_address, port, name, raw_name, players, max_players,
-                is_password_protected, country, region, city, lat, lon, isp, client_required_mod_ids)
-            VALUES ($sid, $ip, $port, $name, $raw_name, $players, $max, $pw, $country, $region, $city, $lat, $lon, $isp, $mods)";
-        ins.Parameters.AddWithValue("$sid", snapshotId);
-        ins.Parameters.AddWithValue("$ip", s.IpAddress);
-        ins.Parameters.AddWithValue("$port", s.Port);
-        ins.Parameters.AddWithValue("$name", s.Name != null ? (object)StripRichText(s.Name) : DBNull.Value);
-        ins.Parameters.AddWithValue("$raw_name", (object?)s.Name ?? DBNull.Value);
-        ins.Parameters.AddWithValue("$players", (object?)s.Players ?? DBNull.Value);
-        ins.Parameters.AddWithValue("$max", (object?)s.MaxPlayers ?? DBNull.Value);
-        ins.Parameters.AddWithValue("$pw", s.IsPasswordProtected ? 1 : 0);
-        ins.Parameters.AddWithValue("$country", (object?)s.Country ?? DBNull.Value);
-        ins.Parameters.AddWithValue("$region", (object?)s.Region ?? DBNull.Value);
-        ins.Parameters.AddWithValue("$city", (object?)s.City ?? DBNull.Value);
-        ins.Parameters.AddWithValue("$lat", (object?)s.Lat ?? DBNull.Value);
-        ins.Parameters.AddWithValue("$lon", (object?)s.Lon ?? DBNull.Value);
-        ins.Parameters.AddWithValue("$isp", (object?)s.Isp ?? DBNull.Value);
-        ins.Parameters.AddWithValue("$mods", s.ClientRequiredModIds is { Length: > 0 }
+        var strippedName = s.Name != null ? StripRichText(s.Name) : null;
+        var ts = DateTime.Parse(timestamp).ToUniversalTime();
+
+        // Upsert server identity
+        await using var upsertServer = new NpgsqlCommand(@"
+            INSERT INTO psl_servers (ip_address, port, country, region, city, lat, lon, isp, game_version, first_seen, last_seen)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+            ON CONFLICT(ip_address, port) DO UPDATE SET
+                country = EXCLUDED.country, region = EXCLUDED.region, city = EXCLUDED.city,
+                lat = EXCLUDED.lat, lon = EXCLUDED.lon, isp = EXCLUDED.isp,
+                game_version = EXCLUDED.game_version, last_seen = EXCLUDED.last_seen
+            RETURNING id", conn, txn);
+        upsertServer.Parameters.AddWithValue(s.IpAddress);
+        upsertServer.Parameters.AddWithValue(s.Port);
+        upsertServer.Parameters.AddWithValue((object?)s.Country ?? DBNull.Value);
+        upsertServer.Parameters.AddWithValue((object?)s.Region ?? DBNull.Value);
+        upsertServer.Parameters.AddWithValue((object?)s.City ?? DBNull.Value);
+        upsertServer.Parameters.AddWithValue((object?)s.Lat ?? DBNull.Value);
+        upsertServer.Parameters.AddWithValue((object?)s.Lon ?? DBNull.Value);
+        upsertServer.Parameters.AddWithValue((object?)s.Isp ?? DBNull.Value);
+        upsertServer.Parameters.AddWithValue(version);
+        upsertServer.Parameters.AddWithValue(ts);
+        var serverId = (int)(await upsertServer.ExecuteScalarAsync())!;
+
+        // Check if name changed
+        await using var getLastName = new NpgsqlCommand(@"
+            SELECT id, name FROM psl_server_names
+            WHERE server_id = $1 ORDER BY id DESC LIMIT 1", conn, txn);
+        getLastName.Parameters.AddWithValue(serverId);
+        await using var nameReader = await getLastName.ExecuteReaderAsync();
+
+        if (await nameReader.ReadAsync())
+        {
+            var lastNameId = nameReader.GetInt32(0);
+            var lastName = nameReader.IsDBNull(1) ? null : nameReader.GetString(1);
+            await nameReader.CloseAsync();
+
+            if (lastName == strippedName)
+            {
+                await using var updateName = new NpgsqlCommand(
+                    "UPDATE psl_server_names SET last_seen = $1 WHERE id = $2", conn, txn);
+                updateName.Parameters.AddWithValue(ts);
+                updateName.Parameters.AddWithValue(lastNameId);
+                await updateName.ExecuteNonQueryAsync();
+            }
+            else
+            {
+                await using var insertName = new NpgsqlCommand(@"
+                    INSERT INTO psl_server_names (server_id, name, raw_name, first_seen, last_seen)
+                    VALUES ($1, $2, $3, $4, $4)", conn, txn);
+                insertName.Parameters.AddWithValue(serverId);
+                insertName.Parameters.AddWithValue((object?)strippedName ?? DBNull.Value);
+                insertName.Parameters.AddWithValue((object?)s.Name ?? DBNull.Value);
+                insertName.Parameters.AddWithValue(ts);
+                await insertName.ExecuteNonQueryAsync();
+            }
+        }
+        else
+        {
+            await nameReader.CloseAsync();
+            await using var insertName = new NpgsqlCommand(@"
+                INSERT INTO psl_server_names (server_id, name, raw_name, first_seen, last_seen)
+                VALUES ($1, $2, $3, $4, $4)", conn, txn);
+            insertName.Parameters.AddWithValue(serverId);
+            insertName.Parameters.AddWithValue((object?)strippedName ?? DBNull.Value);
+            insertName.Parameters.AddWithValue((object?)s.Name ?? DBNull.Value);
+            insertName.Parameters.AddWithValue(ts);
+            await insertName.ExecuteNonQueryAsync();
+        }
+
+        // Insert snapshot data
+        await using var insertSnap = new NpgsqlCommand(@"
+            INSERT INTO psl_server_snapshots (snapshot_id, server_id, players, max_players, is_password_protected, client_required_mod_ids)
+            VALUES ($1, $2, $3, $4, $5, $6)", conn, txn);
+        insertSnap.Parameters.AddWithValue(snapshotId);
+        insertSnap.Parameters.AddWithValue(serverId);
+        insertSnap.Parameters.AddWithValue((object?)s.Players ?? DBNull.Value);
+        insertSnap.Parameters.AddWithValue((object?)s.MaxPlayers ?? DBNull.Value);
+        insertSnap.Parameters.AddWithValue(s.IsPasswordProtected);
+        insertSnap.Parameters.AddWithValue(s.ClientRequiredModIds is { Length: > 0 }
             ? (object)JsonSerializer.Serialize(s.ClientRequiredModIds)
             : DBNull.Value);
-        ins.ExecuteNonQuery();
+        await insertSnap.ExecuteNonQueryAsync();
     }
 
-    txn.Commit();
+    await txn.CommitAsync();
     Console.WriteLine($"[DB] Saved {servers.Count} servers for {version}");
 }
 
@@ -431,6 +437,224 @@ class ServerInfo
     public double? Lon { get; set; }
     public string? Isp { get; set; }
     public ulong[]? ClientRequiredModIds { get; set; }
+}
+
+// =============================================================================
+// SteamKit2 Session - replaces Steamworks.NET, no Steam client needed
+// =============================================================================
+class SteamSession
+{
+    private readonly SteamClient _client;
+    private readonly CallbackManager _callbacks;
+    private readonly SteamUser _user;
+    private readonly SteamAuthTicket _authTicket;
+
+    private bool _isRunning;
+    public bool IsLoggedIn { get; private set; }
+
+    private readonly string _credentialsPath = Path.Combine(AppContext.BaseDirectory, "steam_credentials.json");
+
+    public SteamSession()
+    {
+        _client = new SteamClient();
+        _callbacks = new CallbackManager(_client);
+        _user = _client.GetHandler<SteamUser>()!;
+        _authTicket = _client.GetHandler<SteamAuthTicket>()!;
+
+        _callbacks.Subscribe<SteamClient.ConnectedCallback>(OnConnected);
+        _callbacks.Subscribe<SteamClient.DisconnectedCallback>(OnDisconnected);
+        _callbacks.Subscribe<SteamUser.LoggedOnCallback>(OnLoggedOn);
+        _callbacks.Subscribe<SteamUser.LoggedOffCallback>(OnLoggedOff);
+    }
+
+    public async Task Login()
+    {
+        Console.WriteLine("[Steam] Connecting to Steam...");
+        _isRunning = true;
+        _client.Connect();
+
+        // Wait for connection
+        while (_isRunning && !_client.IsConnected)
+        {
+            _callbacks.RunWaitCallbacks(TimeSpan.FromMilliseconds(100));
+        }
+
+        if (!_client.IsConnected)
+        {
+            Console.Error.WriteLine("[Steam] Failed to connect to Steam network");
+            return;
+        }
+
+        // Try saved credentials first
+        var savedCreds = LoadCredentials();
+        if (savedCreds != null)
+        {
+            Console.WriteLine($"[Steam] Logging in as {savedCreds.Username} (saved credentials)...");
+            _user.LogOn(new SteamUser.LogOnDetails
+            {
+                Username = savedCreds.Username,
+                AccessToken = savedCreds.RefreshToken,
+            });
+        }
+        else
+        {
+            // Interactive login
+            Console.Write("[Steam] Username: ");
+            var username = Console.ReadLine()?.Trim() ?? "";
+            Console.Write("[Steam] Password: ");
+            var password = ReadPassword();
+            Console.WriteLine();
+
+            // Start auth session for Steam Guard support
+            var authSession = await _client.Authentication.BeginAuthSessionViaCredentialsAsync(
+                new AuthSessionDetails
+                {
+                    Username = username,
+                    Password = password,
+                    IsPersistentSession = true,
+                    Authenticator = new UserConsoleAuthenticator(),
+                });
+
+            var pollResult = await authSession.PollingWaitForResultAsync();
+
+            Console.WriteLine($"[Steam] Got refresh token, logging in...");
+            _user.LogOn(new SteamUser.LogOnDetails
+            {
+                Username = pollResult.AccountName,
+                AccessToken = pollResult.RefreshToken,
+            });
+
+            // Save for next time
+            SaveCredentials(new SavedCredentials
+            {
+                Username = pollResult.AccountName,
+                RefreshToken = pollResult.RefreshToken,
+            });
+        }
+
+        // Wait for login result
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (!IsLoggedIn && DateTime.UtcNow < deadline)
+        {
+            _callbacks.RunWaitCallbacks(TimeSpan.FromMilliseconds(100));
+        }
+    }
+
+    public async Task<string?> GetAuthTicket(uint appId)
+    {
+        try
+        {
+            Console.WriteLine($"[Steam] Requesting auth ticket for app {appId}...");
+            var ticketInfo = await _authTicket.GetAuthTicketForWebApi(appId, "puck");
+            return Convert.ToHexString(ticketInfo.Ticket);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Steam] Auth ticket failed: {ex.Message}");
+            // If using saved creds that expired, delete them and prompt re-login
+            if (File.Exists(_credentialsPath))
+            {
+                Console.Error.WriteLine("[Steam] Deleting saved credentials, please restart and login again.");
+                File.Delete(_credentialsPath);
+            }
+            return null;
+        }
+    }
+
+    public void RunCallbacks()
+    {
+        _callbacks.RunWaitCallbacks(TimeSpan.FromMilliseconds(1));
+    }
+
+    public void Disconnect()
+    {
+        _isRunning = false;
+        _client.Disconnect();
+    }
+
+    private void OnConnected(SteamClient.ConnectedCallback cb)
+    {
+        Console.WriteLine("[Steam] Connected to Steam network");
+    }
+
+    private void OnDisconnected(SteamClient.DisconnectedCallback cb)
+    {
+        if (!_isRunning) return;
+        Console.WriteLine("[Steam] Disconnected from Steam, reconnecting in 5s...");
+        IsLoggedIn = false;
+        Task.Delay(5000).ContinueWith(_ => _client.Connect());
+    }
+
+    private void OnLoggedOn(SteamUser.LoggedOnCallback cb)
+    {
+        if (cb.Result != EResult.OK)
+        {
+            Console.Error.WriteLine($"[Steam] Login failed: {cb.Result}");
+            if (cb.Result is EResult.InvalidPassword or EResult.Expired or EResult.AccessDenied)
+            {
+                // Delete bad saved credentials
+                if (File.Exists(_credentialsPath))
+                    File.Delete(_credentialsPath);
+            }
+            return;
+        }
+
+        Console.WriteLine($"[Steam] Logged in as {_client.SteamID}");
+        IsLoggedIn = true;
+    }
+
+    private void OnLoggedOff(SteamUser.LoggedOffCallback cb)
+    {
+        Console.WriteLine($"[Steam] Logged off: {cb.Result}");
+        IsLoggedIn = false;
+    }
+
+    private SavedCredentials? LoadCredentials()
+    {
+        if (!File.Exists(_credentialsPath)) return null;
+        try
+        {
+            var json = File.ReadAllText(_credentialsPath);
+            return JsonSerializer.Deserialize<SavedCredentials>(json);
+        }
+        catch { return null; }
+    }
+
+    private void SaveCredentials(SavedCredentials creds)
+    {
+        File.WriteAllText(_credentialsPath, JsonSerializer.Serialize(creds));
+        Console.WriteLine("[Steam] Credentials saved for next run.");
+    }
+
+    private static string ReadPassword()
+    {
+        try
+        {
+            // Try masked input
+            var password = "";
+            while (true)
+            {
+                var key = Console.ReadKey(true);
+                if (key.Key == ConsoleKey.Enter) break;
+                if (key.Key == ConsoleKey.Backspace && password.Length > 0)
+                    password = password[..^1];
+                else if (!char.IsControl(key.KeyChar))
+                    password += key.KeyChar;
+            }
+            return password;
+        }
+        catch (InvalidOperationException)
+        {
+            // Fallback for redirected input (will echo password)
+            return Console.ReadLine()?.Trim() ?? "";
+        }
+    }
+}
+
+class SavedCredentials
+{
+    public string Username { get; set; } = "";
+    public string RefreshToken { get; set; } = "";
 }
 
 // =============================================================================
@@ -463,7 +687,6 @@ class PersistentConnection
         {
             if (IsConnected) return;
 
-            // Clean up old socket
             if (_socket != null)
             {
                 try { await _socket.DisconnectAsync(); } catch { }
@@ -510,7 +733,6 @@ class PersistentConnection
                 Console.Error.WriteLine($"[{Version}] Socket error: {error}");
             };
 
-            // Connect
             try
             {
                 await _socket.ConnectAsync();
@@ -543,7 +765,6 @@ class PersistentConnection
 
         await _socket.EmitAsync("playerAuthenticateRequest", authAck, authData);
 
-        // Wait up to 10 seconds for auth
         if (await Task.WhenAny(tcs.Task, Task.Delay(10000)) != tcs.Task)
         {
             Console.Error.WriteLine($"[{Version}] Auth timed out");
@@ -605,7 +826,7 @@ class PersistentConnection
     }
 }
 
-// DefaultClientWebSocket subclass that skips SSL certificate validation
+// SSL cert bypass for puck1's expired cert
 class InsecureClientWebSocket : SocketIOClient.Transport.WebSockets.DefaultClientWebSocket
 {
     public InsecureClientWebSocket()
