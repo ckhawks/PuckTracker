@@ -112,8 +112,5 @@ The `.env`, `steam_credentials.json`, and `.mmdb` files persist between updates.
 - **SteamAPI login failed**: Delete `steam_credentials.json` and run interactively
   again to re-authenticate
 - **Database connection failed**: Check `DATABASE_URL` in `.env`
-- **b202 connection fails**: The b202 master server (`puck1.nasejevs.com`) has an
-  expired SSL cert. The app bypasses this automatically, but some firewalls may
-  block it
 - **No servers found**: Make sure the `psl_` tables exist in PostgreSQL
   (run the migration)

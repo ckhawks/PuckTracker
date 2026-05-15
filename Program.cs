@@ -63,19 +63,19 @@ if (ticket == null)
 Console.WriteLine($"[Steam] Got auth ticket ({ticket.Length / 2} bytes)");
 
 // --- Create persistent connections ---
-var b202Conn = new PersistentConnection("b202", "wss://puck1.nasejevs.com", ticket);
-var b312Conn = new PersistentConnection("b312", "wss://puck2.nasejevs.com", ticket);
+// b202 disabled — game updated to b323
+var b323Conn = new PersistentConnection("b323", "wss://puck2.nasejevs.com", ticket);
 
 Console.WriteLine($"PuckServerTracker started (mode: {(runOnce ? "single scan" : "continuous, every 15 min")})");
 
-await Task.WhenAll(b202Conn.EnsureConnected(), b312Conn.EnsureConnected());
+await b323Conn.EnsureConnected();
 
 try
 {
     do
     {
         steamSession.RunCallbacks();
-        await Scan(db, b202Conn, b312Conn);
+        await Scan(db, b323Conn);
 
         if (!runOnce)
         {
@@ -90,8 +90,7 @@ try
 }
 finally
 {
-    await b202Conn.Disconnect();
-    await b312Conn.Disconnect();
+    await b323Conn.Disconnect();
     steamSession.Disconnect();
     Console.WriteLine("[Steam] Disconnected.");
 }
@@ -101,22 +100,18 @@ return 0;
 // =============================================================================
 // Scan
 // =============================================================================
-async Task Scan(NpgsqlDataSource db, PersistentConnection b202, PersistentConnection b312)
+async Task Scan(NpgsqlDataSource db, PersistentConnection b323)
 {
     var timestamp = DateTime.UtcNow.ToString("o");
     Console.WriteLine($"\n{"".PadRight(60, '=')}");
     Console.WriteLine($"Scan at {timestamp}");
     Console.WriteLine("".PadRight(60, '='));
 
-    await Task.WhenAll(b202.EnsureConnected(), b312.EnsureConnected());
+    await b323.EnsureConnected();
 
-    var b202Task = b202.RequestServerList("playerGetServerBrowserServersRequest", ParseB202Response);
-    var b312Task = b312.RequestServerList("playerGetServerBrowserEndPointsRequest", ParseB312Response);
+    var b323Task = b323.RequestServerList("playerGetServerBrowserEndPointsRequest", ParseB323Response);
 
-    await Task.WhenAll(b202Task, b312Task);
-
-    await ProcessResult("b202", b202Task, db, timestamp);
-    await ProcessResult("b312", b312Task, db, timestamp);
+    await ProcessResult("b323", b323Task, db, timestamp);
 }
 
 async Task ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlDataSource db, string timestamp)
@@ -137,46 +132,7 @@ async Task ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlData
 // =============================================================================
 // Response Parsers
 // =============================================================================
-Task<List<ServerInfo>> ParseB202Response(SocketIOResponse response)
-{
-    var json = response.GetValue<JsonElement>();
-    var servers = new List<ServerInfo>();
-    JsonElement serversArray;
-
-    if (json.TryGetProperty("data", out var data) &&
-        data.TryGetProperty("serverBrowserServers", out serversArray))
-    { }
-    else if (json.TryGetProperty("serverBrowserServers", out serversArray))
-    { }
-    else if (json.TryGetProperty("servers", out serversArray))
-    { }
-    else if (json.ValueKind == JsonValueKind.Array)
-    { serversArray = json; }
-    else
-    {
-        var raw = json.ToString();
-        Console.Error.WriteLine($"[b202] Unexpected format: {raw[..Math.Min(200, raw.Length)]}");
-        return Task.FromResult(servers);
-    }
-
-    foreach (var s in serversArray.EnumerateArray())
-    {
-        servers.Add(new ServerInfo
-        {
-            IpAddress = s.GetProperty("ipAddress").GetString() ?? "",
-            Port = s.GetProperty("port").GetUInt16(),
-            Name = s.TryGetProperty("name", out var n) ? n.GetString() : null,
-            Players = s.TryGetProperty("players", out var p) ? p.GetInt32() : null,
-            MaxPlayers = s.TryGetProperty("maxPlayers", out var m) ? m.GetInt32() : null,
-            IsPasswordProtected = s.TryGetProperty("isPasswordProtected", out var pp) && pp.GetBoolean(),
-        });
-    }
-
-    Console.WriteLine($"[b202] Parsed {servers.Count} servers");
-    return Task.FromResult(servers);
-}
-
-async Task<List<ServerInfo>> ParseB312Response(SocketIOResponse response)
+async Task<List<ServerInfo>> ParseB323Response(SocketIOResponse response)
 {
     var json = response.GetValue<JsonElement>();
     var endpoints = new List<ServerInfo>();
@@ -191,7 +147,7 @@ async Task<List<ServerInfo>> ParseB312Response(SocketIOResponse response)
     { endpointsArray = json; }
     else
     {
-        Console.Error.WriteLine($"[b312] Unexpected format");
+        Console.Error.WriteLine($"[b323] Unexpected format");
         return endpoints;
     }
 
@@ -204,9 +160,9 @@ async Task<List<ServerInfo>> ParseB312Response(SocketIOResponse response)
         });
     }
 
-    Console.WriteLine($"[b312] Fetching TCP previews for {endpoints.Count} endpoints...");
+    Console.WriteLine($"[b323] Fetching TCP previews for {endpoints.Count} endpoints...");
     await Task.WhenAll(endpoints.Select(TcpPreview));
-    Console.WriteLine($"[b312] Parsed {endpoints.Count} servers");
+    Console.WriteLine($"[b323] Parsed {endpoints.Count} servers");
     return endpoints;
 }
 
@@ -478,9 +434,15 @@ class SteamSession
     private readonly SteamClient _client;
     private readonly CallbackManager _callbacks;
     private readonly SteamUser _user;
+    private readonly SteamApps _apps;
     private readonly SteamAuthTicket _authTicket;
 
     private bool _isRunning;
+    private SteamUser.LogOnDetails? _logOnDetails;
+    private TaskCompletionSource _licensesReceived = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private TaskCompletionSource _connected = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private TaskCompletionSource _loggedOn = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private Thread? _pumpThread;
     public bool IsLoggedIn { get; private set; }
 
     private readonly string _credentialsPath = Path.Combine(AppContext.BaseDirectory, "steam_credentials.json");
@@ -490,27 +452,26 @@ class SteamSession
         _client = new SteamClient();
         _callbacks = new CallbackManager(_client);
         _user = _client.GetHandler<SteamUser>()!;
+        _apps = _client.GetHandler<SteamApps>()!;
         _authTicket = _client.GetHandler<SteamAuthTicket>()!;
 
         _callbacks.Subscribe<SteamClient.ConnectedCallback>(OnConnected);
         _callbacks.Subscribe<SteamClient.DisconnectedCallback>(OnDisconnected);
         _callbacks.Subscribe<SteamUser.LoggedOnCallback>(OnLoggedOn);
         _callbacks.Subscribe<SteamUser.LoggedOffCallback>(OnLoggedOff);
+        _callbacks.Subscribe<SteamApps.LicenseListCallback>(OnLicenseList);
     }
 
     public async Task Login()
     {
         Console.WriteLine("[Steam] Connecting to Steam...");
         _isRunning = true;
+        StartPumpThread();
         _client.Connect();
 
-        // Wait for connection
-        while (_isRunning && !_client.IsConnected)
-        {
-            _callbacks.RunWaitCallbacks(TimeSpan.FromMilliseconds(100));
-        }
-
-        if (!_client.IsConnected)
+        // Wait for connection (pump thread handles callbacks)
+        var connectWait = await Task.WhenAny(_connected.Task, Task.Delay(TimeSpan.FromSeconds(15)));
+        if (connectWait != _connected.Task)
         {
             Console.Error.WriteLine("[Steam] Failed to connect to Steam network");
             return;
@@ -521,14 +482,23 @@ class SteamSession
         if (savedCreds != null)
         {
             Console.WriteLine($"[Steam] Logging in as {savedCreds.Username} (saved credentials)...");
-            _user.LogOn(new SteamUser.LogOnDetails
+            _logOnDetails = new SteamUser.LogOnDetails
             {
                 Username = savedCreds.Username,
                 AccessToken = savedCreds.RefreshToken,
-            });
+            };
+            _user.LogOn(_logOnDetails);
         }
         else
         {
+            if (Console.IsInputRedirected)
+            {
+                Console.Error.WriteLine("[Steam] No saved credentials and stdin is not a TTY (running under systemd?).");
+                Console.Error.WriteLine("[Steam] Stop the service, run interactively once to mint a refresh token, then restart the service:");
+                Console.Error.WriteLine("[Steam]   sudo systemctl stop pucktracker && ./PuckTracker --once && sudo systemctl start pucktracker");
+                return;
+            }
+
             // Interactive login
             Console.Write("[Steam] Username: ");
             var username = Console.ReadLine()?.Trim() ?? "";
@@ -549,11 +519,12 @@ class SteamSession
             var pollResult = await authSession.PollingWaitForResultAsync();
 
             Console.WriteLine($"[Steam] Got refresh token, logging in...");
-            _user.LogOn(new SteamUser.LogOnDetails
+            _logOnDetails = new SteamUser.LogOnDetails
             {
                 Username = pollResult.AccountName,
                 AccessToken = pollResult.RefreshToken,
-            });
+            };
+            _user.LogOn(_logOnDetails);
 
             // Save for next time
             SaveCredentials(new SavedCredentials
@@ -564,48 +535,81 @@ class SteamSession
         }
 
         // Wait for login result
-        var deadline = DateTime.UtcNow.AddSeconds(15);
-        while (!IsLoggedIn && DateTime.UtcNow < deadline)
-        {
-            _callbacks.RunWaitCallbacks(TimeSpan.FromMilliseconds(100));
-        }
+        await Task.WhenAny(_loggedOn.Task, Task.Delay(TimeSpan.FromSeconds(15)));
     }
 
     public async Task<string?> GetAuthTicket(uint appId)
     {
-        try
+        // Wait for the license list — GetAuthTicketForWebApi is canceled internally
+        // if it's called before the account's licenses have been received.
+        var waitTask = _licensesReceived.Task;
+        if (!waitTask.IsCompleted)
         {
-            Console.WriteLine($"[Steam] Requesting auth ticket for app {appId}...");
-            var ticketInfo = await _authTicket.GetAuthTicketForWebApi(appId, "puck");
-            return Convert.ToHexString(ticketInfo.Ticket);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[Steam] Auth ticket failed: {ex.Message}");
-            // If using saved creds that expired, delete them and prompt re-login
-            if (File.Exists(_credentialsPath))
+            Console.WriteLine("[Steam] Waiting for license list before requesting auth ticket...");
+            var completed = await Task.WhenAny(waitTask, Task.Delay(TimeSpan.FromSeconds(15)));
+            if (completed != waitTask)
             {
-                Console.Error.WriteLine("[Steam] Deleting saved credentials, please restart and login again.");
-                File.Delete(_credentialsPath);
+                Console.Error.WriteLine("[Steam] Timed out waiting for license list");
+                return null;
             }
-            return null;
         }
+
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            try
+            {
+                Console.WriteLine($"[Steam] Requesting auth ticket for app {appId} (attempt {attempt})...");
+                var ticketInfo = await _authTicket.GetAuthTicketForWebApi(appId, "puck");
+                return Convert.ToHexString(ticketInfo.Ticket);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[Steam] Auth ticket failed (attempt {attempt}): {ex.Message}");
+                if (attempt < 3)
+                    await Task.Delay(TimeSpan.FromSeconds(2 * attempt));
+            }
+        }
+        // Don't delete saved credentials here — logon succeeded, so the refresh token
+        // is fine. Ticket failures are transient (network / GC not ready).
+        return null;
     }
 
     public void RunCallbacks()
     {
-        _callbacks.RunWaitCallbacks(TimeSpan.FromMilliseconds(1));
+        // No-op: callbacks are pumped by the background thread started in Login().
+    }
+
+    private void StartPumpThread()
+    {
+        if (_pumpThread != null) return;
+        _pumpThread = new Thread(() =>
+        {
+            while (_isRunning)
+            {
+                try { _callbacks.RunWaitCallbacks(TimeSpan.FromMilliseconds(100)); }
+                catch (Exception ex) { Console.Error.WriteLine($"[Steam] Pump error: {ex.Message}"); }
+            }
+        })
+        { IsBackground = true, Name = "SteamKit-Pump" };
+        _pumpThread.Start();
     }
 
     public void Disconnect()
     {
         _isRunning = false;
         _client.Disconnect();
+        _pumpThread?.Join(TimeSpan.FromSeconds(2));
     }
 
     private void OnConnected(SteamClient.ConnectedCallback cb)
     {
         Console.WriteLine("[Steam] Connected to Steam network");
+        _connected.TrySetResult();
+        if (_logOnDetails != null)
+        {
+            Console.WriteLine($"[Steam] Re-issuing logon as {_logOnDetails.Username}...");
+            _user.LogOn(_logOnDetails);
+        }
     }
 
     private void OnDisconnected(SteamClient.DisconnectedCallback cb)
@@ -613,7 +617,11 @@ class SteamSession
         if (!_isRunning) return;
         Console.WriteLine("[Steam] Disconnected from Steam, reconnecting in 5s...");
         IsLoggedIn = false;
-        Task.Delay(5000).ContinueWith(_ => _client.Connect());
+        // Reset gates so future awaits block until the next reconnect/logon completes.
+        _connected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _loggedOn = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _licensesReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task.Delay(5000).ContinueWith(_ => { if (_isRunning) _client.Connect(); });
     }
 
     private void OnLoggedOn(SteamUser.LoggedOnCallback cb)
@@ -623,21 +631,41 @@ class SteamSession
             Console.Error.WriteLine($"[Steam] Login failed: {cb.Result}");
             if (cb.Result is EResult.InvalidPassword or EResult.Expired or EResult.AccessDenied)
             {
-                // Delete bad saved credentials
+                // Saved refresh token is no longer valid — stop retrying so we don't
+                // hammer Steam with a token it keeps rejecting. Operator must restart
+                // the process and re-auth interactively to mint a new refresh token.
+                Console.Error.WriteLine("[Steam] Refresh token rejected. Deleting saved credentials and exiting reconnect loop — restart and re-auth interactively.");
                 if (File.Exists(_credentialsPath))
                     File.Delete(_credentialsPath);
+                _logOnDetails = null;
+                _isRunning = false;
+                _client.Disconnect();
+            }
+            else if (cb.Result is EResult.TryAnotherCM or EResult.ServiceUnavailable)
+            {
+                // Force disconnect so SteamKit2 picks a different CM server on reconnect
+                _client.Disconnect();
             }
             return;
         }
 
         Console.WriteLine($"[Steam] Logged in as {_client.SteamID}");
         IsLoggedIn = true;
+        _loggedOn.TrySetResult();
     }
 
     private void OnLoggedOff(SteamUser.LoggedOffCallback cb)
     {
         Console.WriteLine($"[Steam] Logged off: {cb.Result}");
         IsLoggedIn = false;
+        // Reset so the next logon waits for a fresh LicenseListCallback before issuing tickets.
+        _licensesReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    private void OnLicenseList(SteamApps.LicenseListCallback cb)
+    {
+        Console.WriteLine($"[Steam] License list received ({cb.LicenseList.Count} licenses)");
+        _licensesReceived.TrySetResult();
     }
 
     private SavedCredentials? LoadCredentials()

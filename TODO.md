@@ -18,7 +18,6 @@
 - [ ] Handle Steam refresh token expiry (re-prompt or alert)
 - [ ] Clean up old snapshots (auto-prune data older than X months?)
 - [ ] Update GeoIP databases periodically (MaxMind updates weekly)
-- [ ] Consider storing ping_port for b202 servers
 
 ## Data quality
 - [ ] More ISP → country overrides as needed (like Ondrej Vrana → CZ)
