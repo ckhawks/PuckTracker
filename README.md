@@ -6,7 +6,7 @@ No game client or Steam client required - authenticates directly via [SteamKit2]
 
 ## What it tracks
 
-- All public servers on b323 (current game build)
+- All public servers on b897 (current game build)
 - Player counts, max players, password status
 - Server names (with change history)
 - GeoIP location and ISP (via MaxMind GeoLite2)
@@ -37,7 +37,7 @@ First run prompts for Steam credentials interactively. A refresh token is saved 
 ## How it works
 
 1. Authenticates to Steam via SteamKit2
-2. Connects to `wss://puck2.nasejevs.com` (b323 master server) via Socket.IO
+2. Connects to `wss://puck1.nasejevs.com` (b897 master server) via Socket.IO
 3. Authenticates with a Steam web API ticket
 4. Requests the endpoint list, then queries each server directly via TCP for the preview payload
 5. Enriches with GeoIP data

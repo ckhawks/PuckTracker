@@ -63,19 +63,19 @@ if (ticket == null)
 Console.WriteLine($"[Steam] Got auth ticket ({ticket.Length / 2} bytes)");
 
 // --- Create persistent connections ---
-// b202 disabled — game updated to b323
-var b323Conn = new PersistentConnection("b323", "wss://puck2.nasejevs.com", ticket);
+// Game updated to b897 — puck2 master (b323) decommissioned, current build back on puck1
+var b897Conn = new PersistentConnection("b897", "wss://puck1.nasejevs.com", ticket);
 
 Console.WriteLine($"PuckServerTracker started (mode: {(runOnce ? "single scan" : "continuous, every 15 min")})");
 
-await b323Conn.EnsureConnected();
+await b897Conn.EnsureConnected();
 
 try
 {
     do
     {
         steamSession.RunCallbacks();
-        await Scan(db, b323Conn);
+        await Scan(db, b897Conn);
 
         if (!runOnce)
         {
@@ -90,7 +90,7 @@ try
 }
 finally
 {
-    await b323Conn.Disconnect();
+    await b897Conn.Disconnect();
     steamSession.Disconnect();
     Console.WriteLine("[Steam] Disconnected.");
 }
@@ -100,18 +100,18 @@ return 0;
 // =============================================================================
 // Scan
 // =============================================================================
-async Task Scan(NpgsqlDataSource db, PersistentConnection b323)
+async Task Scan(NpgsqlDataSource db, PersistentConnection b897)
 {
     var timestamp = DateTime.UtcNow.ToString("o");
     Console.WriteLine($"\n{"".PadRight(60, '=')}");
     Console.WriteLine($"Scan at {timestamp}");
     Console.WriteLine("".PadRight(60, '='));
 
-    await b323.EnsureConnected();
+    await b897.EnsureConnected();
 
-    var b323Task = b323.RequestServerList("playerGetServerBrowserEndPointsRequest", ParseB323Response);
+    var b897Task = b897.RequestServerList("playerGetServerBrowserEndPointsRequest", ParseB323Response);
 
-    await ProcessResult("b323", b323Task, db, timestamp);
+    await ProcessResult("b897", b897Task, db, timestamp);
 }
 
 async Task ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlDataSource db, string timestamp)
@@ -147,7 +147,7 @@ async Task<List<ServerInfo>> ParseB323Response(SocketIOResponse response)
     { endpointsArray = json; }
     else
     {
-        Console.Error.WriteLine($"[b323] Unexpected format");
+        Console.Error.WriteLine($"[b897] Unexpected format");
         return endpoints;
     }
 
@@ -160,9 +160,9 @@ async Task<List<ServerInfo>> ParseB323Response(SocketIOResponse response)
         });
     }
 
-    Console.WriteLine($"[b323] Fetching TCP previews for {endpoints.Count} endpoints...");
+    Console.WriteLine($"[b897] Fetching TCP previews for {endpoints.Count} endpoints...");
     await Task.WhenAll(endpoints.Select(TcpPreview));
-    Console.WriteLine($"[b323] Parsed {endpoints.Count} servers");
+    Console.WriteLine($"[b897] Parsed {endpoints.Count} servers");
     return endpoints;
 }
 
