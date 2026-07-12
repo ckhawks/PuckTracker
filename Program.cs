@@ -63,19 +63,19 @@ if (ticket == null)
 Console.WriteLine($"[Steam] Got auth ticket ({ticket.Length / 2} bytes)");
 
 // --- Create persistent connections ---
-// Game updated to b897 — puck2 master (b323) decommissioned, current build back on puck1
-var b897Conn = new PersistentConnection("b897", "wss://puck1.nasejevs.com", ticket);
+// Game updated to b1153 — current build on puck2 master (puck1/b897 decommissioned)
+var b1153Conn = new PersistentConnection("b1153", "wss://puck2.nasejevs.com", ticket);
 
 Console.WriteLine($"PuckServerTracker started (mode: {(runOnce ? "single scan" : "continuous, every 15 min")})");
 
-await b897Conn.EnsureConnected();
+await b1153Conn.EnsureConnected();
 
 try
 {
     do
     {
         steamSession.RunCallbacks();
-        await Scan(db, b897Conn);
+        await Scan(db, b1153Conn);
 
         if (!runOnce)
         {
@@ -90,7 +90,7 @@ try
 }
 finally
 {
-    await b897Conn.Disconnect();
+    await b1153Conn.Disconnect();
     steamSession.Disconnect();
     Console.WriteLine("[Steam] Disconnected.");
 }
@@ -100,18 +100,18 @@ return 0;
 // =============================================================================
 // Scan
 // =============================================================================
-async Task Scan(NpgsqlDataSource db, PersistentConnection b897)
+async Task Scan(NpgsqlDataSource db, PersistentConnection b1153)
 {
     var timestamp = DateTime.UtcNow.ToString("o");
     Console.WriteLine($"\n{"".PadRight(60, '=')}");
     Console.WriteLine($"Scan at {timestamp}");
     Console.WriteLine("".PadRight(60, '='));
 
-    await b897.EnsureConnected();
+    await b1153.EnsureConnected();
 
-    var b897Task = b897.RequestServerList("playerGetServerBrowserEndPointsRequest", ParseB323Response);
+    var b1153Task = b1153.RequestServerList("playerGetServerBrowserEndPointsRequest", ParseB323Response);
 
-    await ProcessResult("b897", b897Task, db, timestamp);
+    await ProcessResult("b1153", b1153Task, db, timestamp);
 }
 
 async Task ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlDataSource db, string timestamp)
@@ -147,7 +147,7 @@ async Task<List<ServerInfo>> ParseB323Response(SocketIOResponse response)
     { endpointsArray = json; }
     else
     {
-        Console.Error.WriteLine($"[b897] Unexpected format");
+        Console.Error.WriteLine($"[b1153] Unexpected format");
         return endpoints;
     }
 
@@ -160,9 +160,9 @@ async Task<List<ServerInfo>> ParseB323Response(SocketIOResponse response)
         });
     }
 
-    Console.WriteLine($"[b897] Fetching TCP previews for {endpoints.Count} endpoints...");
+    Console.WriteLine($"[b1153] Fetching TCP previews for {endpoints.Count} endpoints...");
     await Task.WhenAll(endpoints.Select(TcpPreview));
-    Console.WriteLine($"[b897] Parsed {endpoints.Count} servers");
+    Console.WriteLine($"[b1153] Parsed {endpoints.Count} servers");
     return endpoints;
 }
 
@@ -763,7 +763,7 @@ class PersistentConnection
                 ConnectionTimeout = TimeSpan.FromSeconds(10),
             });
 
-            // SSL cert bypass for puck1's expired cert
+            // SSL cert bypass for the master server's expired cert
             _socket.ClientWebSocketProvider = () => new InsecureClientWebSocket();
             var defaultHttp = new SocketIOClient.Transport.Http.DefaultHttpClient();
             var httpField = defaultHttp.GetType().GetFields(System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
@@ -885,7 +885,7 @@ class PersistentConnection
     }
 }
 
-// SSL cert bypass for puck1's expired cert
+// SSL cert bypass for the master server's expired cert
 class InsecureClientWebSocket : SocketIOClient.Transport.WebSockets.DefaultClientWebSocket
 {
     public InsecureClientWebSocket()
