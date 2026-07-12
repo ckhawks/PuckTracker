@@ -170,19 +170,20 @@ async Task TcpPreview(ServerInfo server)
 {
     try
     {
+        // Single budget covering connect + write + read. NetworkStream.ReadTimeout/
+        // WriteTimeout are ignored by the async APIs, so a server that accepts the
+        // connection but never replies would hang ReadAsync forever (and stall the
+        // whole Task.WhenAll batch). A CancellationToken is honored by the async APIs.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
         using var client = new System.Net.Sockets.TcpClient();
-        var connectTask = client.ConnectAsync(server.IpAddress, server.Port);
-        if (await Task.WhenAny(connectTask, Task.Delay(2000)) != connectTask)
-            return;
+        await client.ConnectAsync(server.IpAddress, server.Port, cts.Token);
 
         using var stream = client.GetStream();
-        stream.ReadTimeout = 2000;
-        stream.WriteTimeout = 2000;
 
-        await stream.WriteAsync(System.Text.Encoding.UTF8.GetBytes("{\"type\":0}"));
+        await stream.WriteAsync(System.Text.Encoding.UTF8.GetBytes("{\"type\":0}"), cts.Token);
 
         var buffer = new byte[4096];
-        var bytesRead = await stream.ReadAsync(buffer);
+        var bytesRead = await stream.ReadAsync(buffer, cts.Token);
         if (bytesRead == 0) return;
 
         var msg = JsonSerializer.Deserialize<JsonElement>(
