@@ -63,18 +63,36 @@ if (ticket == null)
 Console.WriteLine($"[Steam] Got auth ticket ({ticket.Length / 2} bytes)");
 
 // --- Create persistent connections ---
-// Game updated to b1153 — current build on puck2 master (puck1/b897 decommissioned)
-var b1153Conn = new PersistentConnection("b1153", "wss://puck2.nasejevs.com", ticket);
+// Game updated to b1153 — current build on puck2 master (puck1/b897 decommissioned).
+// Pass a ticket PROVIDER, not a fixed ticket: Steam auth tickets / master-side
+// sessions expire after a few days, so every (re)auth must mint a FRESH ticket.
+// Otherwise the WebSocket stays "connected" but the master silently stops answering
+// server-list requests until the process is restarted. See Authenticate().
+var b1153Conn = new PersistentConnection("b1153", "wss://puck2.nasejevs.com",
+    () => steamSession.GetAuthTicket(PUCK_APP_ID));
 
 Console.WriteLine($"PuckServerTracker started (mode: {(runOnce ? "single scan" : "continuous, every 15 min")})");
 
 await b1153Conn.EnsureConnected();
+
+// Proactively rebuild the connection well before the master expires the session
+// (~days), so a scan never has to eat the reconnect-on-timeout penalty first.
+var lastReconnect = DateTime.UtcNow;
+var reconnectEvery = TimeSpan.FromHours(12);
 
 try
 {
     do
     {
         steamSession.RunCallbacks();
+
+        if (DateTime.UtcNow - lastReconnect >= reconnectEvery)
+        {
+            Console.WriteLine($"[b1153] Proactive reconnect (session age >= {reconnectEvery.TotalHours:0}h)...");
+            await b1153Conn.ForceReconnect();
+            lastReconnect = DateTime.UtcNow;
+        }
+
         await Scan(db, b1153Conn);
 
         if (!runOnce)
@@ -724,18 +742,18 @@ class PersistentConnection
 {
     public string Version { get; }
     private readonly string _url;
-    private readonly string _ticket;
+    private readonly Func<Task<string?>> _ticketProvider;
     private SioClient? _socket;
     private bool _authenticated;
     private readonly SemaphoreSlim _connectLock = new(1, 1);
 
     public bool IsConnected => _socket?.Connected == true && _authenticated;
 
-    public PersistentConnection(string version, string url, string ticket)
+    public PersistentConnection(string version, string url, Func<Task<string?>> ticketProvider)
     {
         Version = version;
         _url = url;
-        _ticket = ticket;
+        _ticketProvider = ticketProvider;
     }
 
     public async Task EnsureConnected()
@@ -814,8 +832,18 @@ class PersistentConnection
     {
         if (_socket == null || !_socket.Connected) return;
 
+        // Mint a FRESH ticket on every (re)auth — a ticket reused across days is
+        // what causes the master to silently stop answering (see the ctor comment).
+        var ticket = await _ticketProvider();
+        if (string.IsNullOrEmpty(ticket))
+        {
+            Console.Error.WriteLine($"[{Version}] Could not obtain a fresh auth ticket");
+            _authenticated = false;
+            return;
+        }
+
         var tcs = new TaskCompletionSource<bool>();
-        var authData = new Dictionary<string, object> { { "ticket", _ticket } };
+        var authData = new Dictionary<string, object> { { "ticket", ticket } };
         Action<SocketIOResponse> authAck = response =>
         {
             Console.WriteLine($"[{Version}] Authenticated");
@@ -832,45 +860,80 @@ class PersistentConnection
         }
     }
 
+    // Tear down the socket entirely so the next EnsureConnected() builds a brand-new
+    // connection and re-authenticates with a fresh ticket — i.e. exactly what a process
+    // restart does. Used to recover a session the master has silently expired.
+    public async Task ForceReconnect()
+    {
+        await _connectLock.WaitAsync();
+        try
+        {
+            if (_socket != null)
+            {
+                try { await _socket.DisconnectAsync(); } catch { }
+                _socket.Dispose();
+                _socket = null;
+            }
+            _authenticated = false;
+        }
+        finally
+        {
+            _connectLock.Release();
+        }
+        await EnsureConnected();
+    }
+
     public async Task<List<ServerInfo>> RequestServerList(
         string requestEvent, Func<SocketIOResponse, Task<List<ServerInfo>>> parser)
     {
-        if (!IsConnected)
+        // Two attempts: if the first request times out, the master has likely expired
+        // our session, so force a full reconnect (fresh ticket) and try once more.
+        for (int attempt = 1; attempt <= 2; attempt++)
         {
-            await EnsureConnected();
             if (!IsConnected)
-                return new List<ServerInfo>();
-        }
-
-        var tcs = new TaskCompletionSource<List<ServerInfo>>();
-
-        Action<SocketIOResponse> ackHandler = response =>
-        {
-            _ = Task.Run(async () =>
             {
-                try
-                {
-                    var parsed = await parser(response);
-                    tcs.TrySetResult(parsed);
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine($"[{Version}] Parse error: {ex.Message}");
-                    tcs.TrySetResult(new List<ServerInfo>());
-                }
-            });
-        };
+                await EnsureConnected();
+                if (!IsConnected)
+                    return new List<ServerInfo>();
+            }
 
-        Console.WriteLine($"[{Version}] Requesting server list...");
-        await _socket!.EmitAsync(requestEvent, ackHandler, (object?)null);
+            var tcs = new TaskCompletionSource<List<ServerInfo>>();
 
-        if (await Task.WhenAny(tcs.Task, Task.Delay(15000)) != tcs.Task)
-        {
-            Console.Error.WriteLine($"[{Version}] Server list request timed out");
-            return new List<ServerInfo>();
+            Action<SocketIOResponse> ackHandler = response =>
+            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var parsed = await parser(response);
+                        tcs.TrySetResult(parsed);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[{Version}] Parse error: {ex.Message}");
+                        tcs.TrySetResult(new List<ServerInfo>());
+                    }
+                });
+            };
+
+            Console.WriteLine($"[{Version}] Requesting server list...");
+            await _socket!.EmitAsync(requestEvent, ackHandler, (object?)null);
+
+            if (await Task.WhenAny(tcs.Task, Task.Delay(15000)) == tcs.Task)
+                return await tcs.Task;
+
+            if (attempt == 1)
+            {
+                Console.Error.WriteLine($"[{Version}] Server list request timed out — forcing fresh reconnect + re-auth");
+                await ForceReconnect();
+            }
+            else
+            {
+                Console.Error.WriteLine($"[{Version}] Server list request timed out after reconnect");
+            }
         }
 
-        return await tcs.Task;
+        return new List<ServerInfo>();
     }
 
     public async Task Disconnect()

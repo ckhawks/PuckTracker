@@ -9,7 +9,7 @@
 ## 1. Publish (on your Windows dev machine)
 
 ```bash
-cd "C:/Projects/Puck Plugins/PuckServerTracker/PuckTracker"
+cd "C:/Projects/Puck Plugins/PuckServerTracker"
 dotnet publish -r linux-x64 --self-contained -o publish/linux-x64
 ```
 
@@ -18,8 +18,8 @@ This creates a self-contained binary — no .NET install needed on the VPS.
 ## 2. Upload to VPS
 
 ```bash
-scp -r PuckTracker/publish/linux-x64/ user@your-vps:~/pucktracker/
-scp PuckTracker/GeoLite2-City.mmdb PuckTracker/GeoLite2-ASN.mmdb user@your-vps:~/pucktracker/
+scp -r publish/linux-x64/ user@your-vps:~/pucktracker/
+scp GeoLite2-City.mmdb GeoLite2-ASN.mmdb user@your-vps:~/pucktracker/
 ```
 
 ## 3. Configure
@@ -99,7 +99,7 @@ To deploy a new version:
 dotnet publish -r linux-x64 --self-contained -o publish/linux-x64
 
 # Upload new binary
-scp PuckTracker/publish/linux-x64/PuckTracker user@your-vps:~/pucktracker/PuckTracker
+scp publish/linux-x64/PuckTracker user@your-vps:~/pucktracker/PuckTracker
 
 # Restart on VPS
 ssh user@your-vps "sudo systemctl restart pucktracker"
