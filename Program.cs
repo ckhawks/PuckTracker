@@ -48,8 +48,6 @@ if (connStr.StartsWith("postgres://") || connStr.StartsWith("postgresql://"))
 var db = NpgsqlDataSource.Create(connStr);
 Console.WriteLine($"[DB] Connected to PostgreSQL");
 
-await EnsureModTables(db);
-
 // --- Steam Login via SteamKit2 ---
 var steamSession = new SteamSession();
 await steamSession.Login();
@@ -463,41 +461,11 @@ async Task SaveSnapshot(NpgsqlDataSource db, string version, List<ServerInfo> se
 // =============================================================================
 // Mod Intel - Workshop metadata cache, watchlist, and change alerts
 // =============================================================================
-async Task EnsureModTables(NpgsqlDataSource db)
-{
-    await using var cmd = db.CreateCommand(@"
-        CREATE TABLE IF NOT EXISTS psl_mods (
-            mod_id BIGINT PRIMARY KEY,
-            title TEXT,
-            creator_steam_id TEXT,
-            time_created TIMESTAMPTZ,
-            time_updated TIMESTAMPTZ,
-            subscriptions INT,
-            banned BOOLEAN NOT NULL DEFAULT false,
-            first_seen TIMESTAMPTZ NOT NULL,
-            last_seen TIMESTAMPTZ NOT NULL,
-            last_resolved TIMESTAMPTZ
-        );
-
-        CREATE TABLE IF NOT EXISTS psl_mod_watch (
-            mod_id BIGINT PRIMARY KEY,
-            reason TEXT,
-            added_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-
-        CREATE TABLE IF NOT EXISTS psl_mod_alerts (
-            id SERIAL PRIMARY KEY,
-            mod_id BIGINT NOT NULL,
-            kind TEXT NOT NULL,
-            detail TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            delivered BOOLEAN NOT NULL DEFAULT false
-        );
-
-        CREATE INDEX IF NOT EXISTS psl_mod_alerts_dedup ON psl_mod_alerts (mod_id, kind, created_at DESC);");
-    await cmd.ExecuteNonQueryAsync();
-}
-
+// psl_mods, psl_mod_watch and psl_mod_alerts are owned by the puckstats schema and
+// created by nextjs/migrations/023_mod_intel.sql. This process deliberately does not
+// create them: schema changes belong in one place, and a tracker that can create tables
+// in production on startup is how they drift out of the migration history in the first
+// place.
 async Task ProcessModIntel(NpgsqlDataSource db, List<ServerInfo> servers, DateTime ts)
 {
     // Which servers run which mod, for alert context
@@ -562,7 +530,22 @@ async Task ProcessModIntel(NpgsqlDataSource db, List<ServerInfo> servers, DateTi
 
     foreach (var chunk in stale.Chunk(200))
     {
-        var details = await ResolveWorkshop(chunk);
+        var (ok, details) = await ResolveWorkshop(chunk);
+
+        // Deleted, hidden and never-existed items come back with result != 1 and are not
+        // cached, so without this they would keep a NULL last_resolved and be re-requested
+        // on every scan forever. Stamp the whole batch as attempted so they back off to
+        // the normal 24h cadence -- but only when the call actually succeeded, or a Steam
+        // outage would silently freeze every mod for a day.
+        if (ok)
+        {
+            await using var stamp = new NpgsqlCommand(
+                "UPDATE psl_mods SET last_resolved = $2 WHERE mod_id = ANY($1) AND last_resolved IS DISTINCT FROM $2", conn);
+            stamp.Parameters.AddWithValue(chunk.Select(x => (long)x).ToArray());
+            stamp.Parameters.AddWithValue(ts);
+            await stamp.ExecuteNonQueryAsync();
+        }
+
         foreach (var (id, d) in details)
         {
             if (known.TryGetValue(id, out var old) && !seeding)
@@ -633,7 +616,9 @@ async Task ProcessModIntel(NpgsqlDataSource db, List<ServerInfo> servers, DateTi
     await DeliverAlerts(conn);
 }
 
-async Task<Dictionary<ulong, (string? Title, string? Creator, DateTime? Created, DateTime? Updated, int Subscriptions, bool Banned)>>
+// Returns Ok = false when the call itself failed, so the caller can tell a Steam outage
+// apart from a batch where every item is legitimately unresolvable.
+async Task<(bool Ok, Dictionary<ulong, (string? Title, string? Creator, DateTime? Created, DateTime? Updated, int Subscriptions, bool Banned)> Details)>
     ResolveWorkshop(ulong[] ids)
 {
     var result = new Dictionary<ulong, (string?, string?, DateTime?, DateTime?, int, bool)>();
@@ -673,8 +658,9 @@ async Task<Dictionary<ulong, (string? Title, string? Creator, DateTime? Created,
     catch (Exception ex)
     {
         Console.Error.WriteLine($"[mods] Workshop lookup failed: {ex.Message}");
+        return (false, result);
     }
-    return result;
+    return (true, result);
 }
 
 async Task DeliverAlerts(NpgsqlConnection conn)
