@@ -25,6 +25,9 @@ No game client or Steam client required - authenticates directly via [SteamKit2]
 # Set database connection
 echo "DATABASE_URL=postgresql://user:pass@host:port/db" > .env
 
+# Optional: deliver mod alerts to Discord (see Mod alerts below)
+echo "DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/..." >> .env
+
 # Single scan
 dotnet run -- --once
 
@@ -44,6 +47,37 @@ First run prompts for Steam credentials interactively. A refresh token is saved 
 6. Writes to PostgreSQL (`psl_servers`, `psl_server_names`, `psl_snapshots`, `psl_server_snapshots`)
 
 Maintains persistent WebSocket connections and reconnects automatically if dropped.
+
+## Mod alerts
+
+Every scan resolves the Workshop IDs servers require into `psl_mods` (title, creator,
+`time_updated`, subscriptions, ban status). The cache refreshes every 24 hours, so a
+change to an already-deployed mod is noticed within a day.
+
+Four things raise an alert into `psl_mod_alerts`, delivered to `DISCORD_WEBHOOK_URL`:
+
+| Kind | Fires when |
+|---|---|
+| `new-mod` | A Workshop ID never seen on any server before appears |
+| `updated` | A mod already in use is updated on the Workshop |
+| `retitled` | A mod's title changes |
+| `banned` | A mod is banned on the Workshop but servers still require it |
+| `watchlist` | A mod listed in `psl_mod_watch` is live anywhere |
+
+`updated` matters most for supply-chain risk: a mod turning hostile in an update, after
+it is already required by dozens of servers, is likelier than a new malicious mod being
+widely adopted. `new-mod` catches what a watchlist cannot, since you cannot list an ID
+you have not seen yet.
+
+To watch a specific mod:
+
+```sql
+INSERT INTO psl_mod_watch (mod_id, reason) VALUES (3776646946, 'why you care');
+```
+
+Alerts are throttled to one per kind per mod per day. If `DISCORD_WEBHOOK_URL` is unset,
+rows stay `delivered = false` and go out once a webhook is configured. The tables are
+created automatically on startup.
 
 ## Deployment
 

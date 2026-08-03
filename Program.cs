@@ -8,7 +8,12 @@ using SioClient = SocketIOClient.SocketIO;
 
 const uint PUCK_APP_ID = 2994020;
 const int POLL_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+// Workshop metadata is cached rather than re-fetched every 15 minutes, but the cache is
+// deliberately short: a title change on a mod that is already deployed across dozens of
+// servers is exactly the signal we want to catch, so staleness here costs detection time.
+const int MOD_CACHE_HOURS = 24;
 bool runOnce = args.Contains("--once");
+var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
 
 // --- Load .env file if present ---
 var envPath = Path.Combine(AppContext.BaseDirectory, ".env");
@@ -42,6 +47,8 @@ if (connStr.StartsWith("postgres://") || connStr.StartsWith("postgresql://"))
 }
 var db = NpgsqlDataSource.Create(connStr);
 Console.WriteLine($"[DB] Connected to PostgreSQL");
+
+await EnsureModTables(db);
 
 // --- Steam Login via SteamKit2 ---
 var steamSession = new SteamSession();
@@ -140,6 +147,7 @@ async Task ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlData
         EnrichWithGeoIP(servers);
         PrintServers(version, servers);
         await SaveSnapshot(db, version, servers, timestamp);
+        await ProcessModIntel(db, servers, DateTime.Parse(timestamp).ToUniversalTime());
     }
     catch (Exception ex)
     {
@@ -451,6 +459,301 @@ async Task SaveSnapshot(NpgsqlDataSource db, string version, List<ServerInfo> se
     await txn.CommitAsync();
     Console.WriteLine($"[DB] Saved {servers.Count} servers for {version}");
 }
+
+// =============================================================================
+// Mod Intel - Workshop metadata cache, watchlist, and change alerts
+// =============================================================================
+async Task EnsureModTables(NpgsqlDataSource db)
+{
+    await using var cmd = db.CreateCommand(@"
+        CREATE TABLE IF NOT EXISTS psl_mods (
+            mod_id BIGINT PRIMARY KEY,
+            title TEXT,
+            creator_steam_id TEXT,
+            time_created TIMESTAMPTZ,
+            time_updated TIMESTAMPTZ,
+            subscriptions INT,
+            banned BOOLEAN NOT NULL DEFAULT false,
+            first_seen TIMESTAMPTZ NOT NULL,
+            last_seen TIMESTAMPTZ NOT NULL,
+            last_resolved TIMESTAMPTZ
+        );
+
+        CREATE TABLE IF NOT EXISTS psl_mod_watch (
+            mod_id BIGINT PRIMARY KEY,
+            reason TEXT,
+            added_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
+        CREATE TABLE IF NOT EXISTS psl_mod_alerts (
+            id SERIAL PRIMARY KEY,
+            mod_id BIGINT NOT NULL,
+            kind TEXT NOT NULL,
+            detail TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            delivered BOOLEAN NOT NULL DEFAULT false
+        );
+
+        CREATE INDEX IF NOT EXISTS psl_mod_alerts_dedup ON psl_mod_alerts (mod_id, kind, created_at DESC);");
+    await cmd.ExecuteNonQueryAsync();
+}
+
+async Task ProcessModIntel(NpgsqlDataSource db, List<ServerInfo> servers, DateTime ts)
+{
+    // Which servers run which mod, for alert context
+    var usage = new Dictionary<ulong, List<string>>();
+    foreach (var s in servers)
+        foreach (var id in s.ClientRequiredModIds ?? [])
+            usage.TryAdd(id, []);
+    foreach (var s in servers)
+        foreach (var id in s.ClientRequiredModIds ?? [])
+            usage[id].Add(StripRichText(s.Name ?? $"{s.IpAddress}:{s.Port}"));
+
+    if (usage.Count == 0) return;
+    var seen = usage.Keys.ToArray();
+
+    await using var conn = await db.OpenConnectionAsync();
+
+    // An empty cache means this is the first run against this database. Every mod would
+    // otherwise look brand new and fire a few dozen alerts at once, which trains you to
+    // ignore them. Seed silently instead and start alerting from the next scan.
+    await using var countCmd = new NpgsqlCommand("SELECT count(*) FROM psl_mods", conn);
+    var seeding = (long)(await countCmd.ExecuteScalarAsync())! == 0;
+
+    var known = new Dictionary<ulong, (string? Title, DateTime? Updated, DateTime? Resolved, bool Banned)>();
+    await using (var cmd = new NpgsqlCommand(
+        "SELECT mod_id, title, time_updated, last_resolved, banned FROM psl_mods WHERE mod_id = ANY($1)", conn))
+    {
+        cmd.Parameters.AddWithValue(seen.Select(x => (long)x).ToArray());
+        await using var r = await cmd.ExecuteReaderAsync();
+        while (await r.ReadAsync())
+            known[(ulong)r.GetInt64(0)] = (
+                r.IsDBNull(1) ? null : r.GetString(1),
+                r.IsDBNull(2) ? null : r.GetDateTime(2),
+                r.IsDBNull(3) ? null : r.GetDateTime(3),
+                r.GetBoolean(4));
+    }
+
+    var alerts = new List<(ulong Id, string Kind, string Detail)>();
+
+    // A mod ID nobody has ever deployed before. This is the alert an ID watchlist cannot
+    // give you, because you cannot list an ID you have not seen yet.
+    foreach (var id in seen.Where(id => !known.ContainsKey(id)))
+        alerts.Add((id, "new-mod", $"First appearance, on {usage[id].Count} server(s): {Sample(usage[id])}"));
+
+    await using (var upsert = new NpgsqlCommand(@"
+        INSERT INTO psl_mods (mod_id, first_seen, last_seen)
+        VALUES ($1, $2, $2)
+        ON CONFLICT (mod_id) DO UPDATE SET last_seen = $2", conn))
+    {
+        upsert.Parameters.Add(new NpgsqlParameter());
+        upsert.Parameters.AddWithValue(ts);
+        foreach (var id in seen)
+        {
+            upsert.Parameters[0].Value = (long)id;
+            await upsert.ExecuteNonQueryAsync();
+        }
+    }
+
+    // Refresh anything never resolved or older than the cache window
+    var stale = seen.Where(id => !known.TryGetValue(id, out var k)
+                                 || k.Resolved == null
+                                 || k.Resolved < ts.AddHours(-MOD_CACHE_HOURS)).ToList();
+
+    foreach (var chunk in stale.Chunk(200))
+    {
+        var details = await ResolveWorkshop(chunk);
+        foreach (var (id, d) in details)
+        {
+            if (known.TryGetValue(id, out var old) && !seeding)
+            {
+                if (old.Title != null && d.Title != old.Title)
+                    alerts.Add((id, "retitled", $"Title changed from \"{old.Title}\" to \"{d.Title}\""));
+                if (old.Updated != null && d.Updated > old.Updated)
+                    alerts.Add((id, "updated", $"\"{d.Title}\" was updated on the Workshop, live on {usage[id].Count} server(s): {Sample(usage[id])}"));
+                if (d.Banned && !old.Banned)
+                    alerts.Add((id, "banned", $"\"{d.Title}\" is now banned on the Workshop but still required by {usage[id].Count} server(s): {Sample(usage[id])}"));
+            }
+
+            await using var cmd = new NpgsqlCommand(@"
+                UPDATE psl_mods SET title = $2, creator_steam_id = $3, time_created = $4,
+                       time_updated = $5, subscriptions = $6, banned = $7, last_resolved = $8
+                WHERE mod_id = $1", conn);
+            cmd.Parameters.AddWithValue((long)id);
+            cmd.Parameters.AddWithValue((object?)d.Title ?? DBNull.Value);
+            cmd.Parameters.AddWithValue((object?)d.Creator ?? DBNull.Value);
+            cmd.Parameters.AddWithValue((object?)d.Created ?? DBNull.Value);
+            cmd.Parameters.AddWithValue((object?)d.Updated ?? DBNull.Value);
+            cmd.Parameters.AddWithValue(d.Subscriptions);
+            cmd.Parameters.AddWithValue(d.Banned);
+            cmd.Parameters.AddWithValue(ts);
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    // Explicit watchlist
+    await using (var cmd = new NpgsqlCommand(
+        "SELECT mod_id, reason FROM psl_mod_watch WHERE mod_id = ANY($1)", conn))
+    {
+        cmd.Parameters.AddWithValue(seen.Select(x => (long)x).ToArray());
+        await using var r = await cmd.ExecuteReaderAsync();
+        while (await r.ReadAsync())
+        {
+            var id = (ulong)r.GetInt64(0);
+            var reason = r.IsDBNull(1) ? "no reason recorded" : r.GetString(1);
+            alerts.Add((id, "watchlist", $"Watched mod is live on {usage[id].Count} server(s) ({reason}): {Sample(usage[id])}"));
+        }
+    }
+
+    if (seeding)
+    {
+        Console.WriteLine($"[mods] Seeded cache with {seen.Length} mods, alerting starts next scan");
+        return;
+    }
+
+    // A watchlisted mod stays live indefinitely, so an un-throttled alert would fire every
+    // 15 minutes forever. One per kind per mod per day is enough to stay informed.
+    var fired = 0;
+    foreach (var (id, kind, detail) in alerts)
+    {
+        await using var cmd = new NpgsqlCommand(@"
+            INSERT INTO psl_mod_alerts (mod_id, kind, detail, created_at)
+            SELECT $1, $2, $3, $4
+            WHERE NOT EXISTS (
+                SELECT 1 FROM psl_mod_alerts
+                WHERE mod_id = $1 AND kind = $2 AND created_at > $4 - interval '24 hours')", conn);
+        cmd.Parameters.AddWithValue((long)id);
+        cmd.Parameters.AddWithValue(kind);
+        cmd.Parameters.AddWithValue(detail);
+        cmd.Parameters.AddWithValue(ts);
+        fired += await cmd.ExecuteNonQueryAsync();
+    }
+
+    if (fired > 0) Console.WriteLine($"[mods] {fired} new alert(s)");
+    await DeliverAlerts(conn);
+}
+
+async Task<Dictionary<ulong, (string? Title, string? Creator, DateTime? Created, DateTime? Updated, int Subscriptions, bool Banned)>>
+    ResolveWorkshop(ulong[] ids)
+{
+    var result = new Dictionary<ulong, (string?, string?, DateTime?, DateTime?, int, bool)>();
+    try
+    {
+        var form = new List<KeyValuePair<string, string>> { new("itemcount", ids.Length.ToString()) };
+        for (var i = 0; i < ids.Length; i++)
+            form.Add(new($"publishedfileids[{i}]", ids[i].ToString()));
+
+        var resp = await http.PostAsync(
+            "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
+            new FormUrlEncodedContent(form));
+        resp.EnsureSuccessStatusCode();
+
+        var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        foreach (var d in doc.RootElement.GetProperty("response").GetProperty("publishedfiledetails").EnumerateArray())
+        {
+            if (!ulong.TryParse(d.GetProperty("publishedfileid").GetString(), out var id)) continue;
+            // result != 1 means removed, hidden, or never existed -- there is nothing to
+            // cache, and overwriting a good title with null would look like a retitle.
+            if (!d.TryGetProperty("result", out var ok) || ok.GetInt32() != 1) continue;
+
+            DateTime? Epoch(string prop) =>
+                d.TryGetProperty(prop, out var v) && v.GetInt64() > 0
+                    ? DateTimeOffset.FromUnixTimeSeconds(v.GetInt64()).UtcDateTime
+                    : null;
+
+            result[id] = (
+                d.TryGetProperty("title", out var t) ? t.GetString() : null,
+                d.TryGetProperty("creator", out var c) ? c.GetString() : null,
+                Epoch("time_created"),
+                Epoch("time_updated"),
+                d.TryGetProperty("subscriptions", out var s) ? s.GetInt32() : 0,
+                d.TryGetProperty("banned", out var b) && b.GetInt32() != 0);
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[mods] Workshop lookup failed: {ex.Message}");
+    }
+    return result;
+}
+
+async Task DeliverAlerts(NpgsqlConnection conn)
+{
+    var webhook = Environment.GetEnvironmentVariable("DISCORD_WEBHOOK_URL");
+
+    var pending = new List<(int Id, string Line)>();
+    await using (var cmd = new NpgsqlCommand(@"
+        SELECT a.id, a.mod_id, a.kind, a.detail, m.title
+        FROM psl_mod_alerts a
+        LEFT JOIN psl_mods m ON m.mod_id = a.mod_id
+        WHERE NOT a.delivered
+        ORDER BY a.id", conn))
+    await using (var r = await cmd.ExecuteReaderAsync())
+        while (await r.ReadAsync())
+        {
+            var modId = r.GetInt64(1);
+            var title = r.IsDBNull(4) ? "(unresolved)" : r.GetString(4);
+            pending.Add((r.GetInt32(0),
+                $"**[{r.GetString(2)}]** {title} (`{modId}`)\n{(r.IsDBNull(3) ? "" : r.GetString(3))}\n" +
+                $"<https://steamcommunity.com/sharedfiles/filedetails/?id={modId}>"));
+        }
+
+    if (pending.Count == 0) return;
+
+    if (string.IsNullOrWhiteSpace(webhook))
+    {
+        // No webhook configured: leave the rows undelivered so they go out once one is,
+        // rather than silently marking them done.
+        Console.Error.WriteLine($"[mods] {pending.Count} alert(s) undelivered, DISCORD_WEBHOOK_URL is not set");
+        return;
+    }
+
+    // Discord caps a message at 2000 characters
+    var sent = new List<int>();
+    var batch = new List<string>();
+    var length = 0;
+
+    async Task Flush()
+    {
+        if (batch.Count == 0) return;
+        var body = JsonSerializer.Serialize(new { content = string.Join("\n\n", batch) });
+        var resp = await http.PostAsync(webhook, new StringContent(body, System.Text.Encoding.UTF8, "application/json"));
+        if (!resp.IsSuccessStatusCode)
+            throw new Exception($"Discord returned {(int)resp.StatusCode}");
+        batch.Clear();
+        length = 0;
+    }
+
+    try
+    {
+        foreach (var (id, line) in pending)
+        {
+            if (length + line.Length + 2 > 1900) await Flush();
+            batch.Add(line);
+            length += line.Length + 2;
+            sent.Add(id);
+        }
+        await Flush();
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[mods] Discord delivery failed: {ex.Message}");
+        // Only mark what actually made it into a successful POST
+        sent = sent.Take(sent.Count - batch.Count).ToList();
+    }
+
+    if (sent.Count == 0) return;
+    await using var mark = new NpgsqlCommand(
+        "UPDATE psl_mod_alerts SET delivered = true WHERE id = ANY($1)", conn);
+    mark.Parameters.AddWithValue(sent.ToArray());
+    await mark.ExecuteNonQueryAsync();
+    Console.WriteLine($"[mods] Delivered {sent.Count} alert(s) to Discord");
+}
+
+string Sample(List<string> names) =>
+    names.Count <= 3
+        ? string.Join(", ", names)
+        : string.Join(", ", names.Take(3)) + $", and {names.Count - 3} more";
 
 // =============================================================================
 // Utilities
