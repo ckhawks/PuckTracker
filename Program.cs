@@ -692,9 +692,10 @@ async Task DeliverAlerts(NpgsqlConnection conn)
         while (await r.ReadAsync())
         {
             var modId = r.GetInt64(1);
-            var title = r.IsDBNull(4) ? "(unresolved)" : r.GetString(4);
+            // The DB keeps the raw text; escaping happens here, at the delivery boundary
+            var title = r.IsDBNull(4) ? "(unresolved)" : DiscordSafe(r.GetString(4));
             pending.Add((r.GetInt32(0),
-                $"**[{r.GetString(2)}]** {title} (`{modId}`)\n{(r.IsDBNull(3) ? "" : r.GetString(3))}\n" +
+                $"**[{r.GetString(2)}]** {title} (`{modId}`)\n{(r.IsDBNull(3) ? "" : DiscordSafe(r.GetString(3)))}\n" +
                 $"<https://steamcommunity.com/sharedfiles/filedetails/?id={modId}>"));
         }
 
@@ -749,6 +750,14 @@ async Task DeliverAlerts(NpgsqlConnection conn)
     await mark.ExecuteNonQueryAsync();
     Console.WriteLine($"[mods] Delivered {sent.Count} alert(s) to Discord");
 }
+
+// Server names and mod titles are attacker-controlled text going into a Discord message.
+// Two things go wrong if it is passed through raw: Unity rich-text colour tags that
+// StripRichText misses (it only matches 6-8 hex digits, so <#f00> survives) are read by
+// Discord as <#channelid> and render as a broken channel mention, and any markdown in a
+// name reformats the alert. Strip every remaining tag, then escape markdown.
+string DiscordSafe(string text) =>
+    Regex.Replace(Regex.Replace(text, @"<[^>]*>", ""), @"([\\`*_~|>])", @"\$1").Trim();
 
 string Sample(List<string> names) =>
     names.Count <= 3
