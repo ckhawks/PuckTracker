@@ -200,12 +200,31 @@ async Task TcpPreview(ServerInfo server)
 
         await stream.WriteAsync(System.Text.Encoding.UTF8.GetBytes("{\"type\":0}"), cts.Token);
 
-        var buffer = new byte[4096];
+        // The preview reply is a single JSON object with no length prefix or delimiter,
+        // so there is nothing to frame on. Read once (which covers every real response --
+        // the largest observed is ~1 KB), and only read again if the JSON won't parse,
+        // which means the reply was split across packets. Looping unconditionally would
+        // block every well-behaved server until the timeout.
+        var buffer = new byte[65536];
         var bytesRead = await stream.ReadAsync(buffer, cts.Token);
         if (bytesRead == 0) return;
 
-        var msg = JsonSerializer.Deserialize<JsonElement>(
-            System.Text.Encoding.UTF8.GetString(buffer, 0, bytesRead));
+        JsonElement msg;
+        while (true)
+        {
+            try
+            {
+                msg = JsonSerializer.Deserialize<JsonElement>(
+                    System.Text.Encoding.UTF8.GetString(buffer, 0, bytesRead));
+                break;
+            }
+            catch (JsonException) when (bytesRead < buffer.Length)
+            {
+                var more = await stream.ReadAsync(buffer.AsMemory(bytesRead), cts.Token);
+                if (more == 0) return;
+                bytesRead += more;
+            }
+        }
 
         if (msg.TryGetProperty("type", out var type) && type.GetInt32() == 1)
         {
@@ -214,10 +233,27 @@ async Task TcpPreview(ServerInfo server)
             server.MaxPlayers = msg.TryGetProperty("maxPlayers", out var m) ? m.GetInt32() : null;
             server.IsPasswordProtected = msg.TryGetProperty("isPasswordProtected", out var pp) && pp.GetBoolean();
             if (msg.TryGetProperty("clientRequiredModIds", out var mods) && mods.ValueKind == JsonValueKind.Array)
-                server.ClientRequiredModIds = mods.EnumerateArray().Select(m => m.GetUInt64()).ToArray();
+                server.ClientRequiredModIds = mods.EnumerateArray()
+                    // The game switched these from JSON numbers to JSON strings around
+                    // 2026-05. GetUInt64() throws on a string element, and the throw used
+                    // to be swallowed here -- which silently NULLed every mod list for
+                    // three months while the rest of the preview kept saving fine.
+                    // Accept both shapes so a future flip back costs nothing.
+                    .Select(m => m.ValueKind == JsonValueKind.String
+                        ? ulong.Parse(m.GetString()!)
+                        : m.GetUInt64())
+                    .ToArray();
         }
     }
-    catch { }
+    // Unreachable hosts and slow hosts are normal and expected every scan, so they stay
+    // quiet. Anything else means the reply parsed differently than we expect -- i.e. the
+    // game's preview format changed -- and must be loud, or it rots undetected.
+    catch (OperationCanceledException) { }
+    catch (System.Net.Sockets.SocketException) { }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[preview] {server.IpAddress}:{server.Port} {ex.GetType().Name}: {ex.Message}");
+    }
 }
 
 // =============================================================================
