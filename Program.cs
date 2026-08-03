@@ -251,11 +251,13 @@ async Task TcpPreview(ServerInfo server)
                     .ToArray();
         }
     }
-    // Unreachable hosts and slow hosts are normal and expected every scan, so they stay
-    // quiet. Anything else means the reply parsed differently than we expect -- i.e. the
-    // game's preview format changed -- and must be loud, or it rots undetected.
+    // Transport-level failures are normal every scan across a few hundred hosts --
+    // timeouts, refused connections, and peers that reset mid-read -- so they stay quiet.
+    // Anything else means the reply parsed differently than we expect -- i.e. the game's
+    // preview format changed -- and must be loud, or it rots undetected.
     catch (OperationCanceledException) { }
     catch (System.Net.Sockets.SocketException) { }
+    catch (IOException) { }
     catch (Exception ex)
     {
         Console.Error.WriteLine($"[preview] {server.IpAddress}:{server.Port} {ex.GetType().Name}: {ex.Message}");

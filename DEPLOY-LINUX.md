@@ -90,22 +90,71 @@ sudo systemctl status pucktracker
 sudo systemctl restart pucktracker
 ```
 
+## Where it runs
+
+Dallas (`extravm-puckvps-1`, 216.146.25.22), unit `pucktracker.service` (lowercase),
+from `/root/PuckTracker`. Reach it with `ssh dallas`.
+
 ## Updating
 
-To deploy a new version:
+The publish is **not** single-file: `PuckTracker` is only the apphost launcher and the
+code lives in `PuckTracker.dll`. Copying just `PuckTracker` deploys nothing.
+
+Which files to copy depends on whether your .NET SDK has been patched since the last
+deploy. Diff before deciding, rather than guessing:
 
 ```bash
 # On Windows: rebuild
 dotnet publish -r linux-x64 --self-contained -o publish/linux-x64
 
-# Upload new binary
-scp publish/linux-x64/PuckTracker user@your-vps:~/pucktracker/PuckTracker
-
-# Restart on VPS
-ssh user@your-vps "sudo systemctl restart pucktracker"
+# Compare against the box
+cd publish/linux-x64
+md5sum * | sed 's/ \*/  /' | awk '{print $2, $1}' | sort > /tmp/local.md5
+ssh dallas "cd /root/PuckTracker && md5sum *" | awk '{print $2, $1}' | sort > /tmp/box.md5
+join /tmp/local.md5 /tmp/box.md5 | awk '$2!=$3{print $1}'
 ```
 
-The `.env`, `steam_credentials.json`, and `.mmdb` files persist between updates.
+If only `PuckTracker.dll` and `PuckTracker.pdb` differ, copy those two:
+
+```bash
+scp PuckTracker.dll PuckTracker.pdb dallas:/root/PuckTracker/
+ssh dallas "chown root:root /root/PuckTracker/PuckTracker.*  && systemctl restart pucktracker"
+```
+
+If the runtime assemblies differ too, replace the whole directory — mixing runtime
+versions is not safe. Skip the GeoIP databases, which are 76 MB and rarely change:
+
+```bash
+cd publish/linux-x64
+tar czf /tmp/deploy.tgz --exclude="GeoLite2-*.mmdb" .
+scp /tmp/deploy.tgz dallas:/root/
+ssh dallas 'systemctl stop pucktracker
+  cd /root/PuckTracker && tar czf /root/pucktracker-backup-$(date +%Y%m%d).tgz --exclude="GeoLite2-*.mmdb" .
+  tar xzf /root/deploy.tgz -C /root/PuckTracker
+  chown -R root:root /root/PuckTracker && chmod +x /root/PuckTracker/PuckTracker
+  systemctl start pucktracker'
+```
+
+`tar` from Windows carries Windows ownership, hence the `chown` — without it the files
+land owned by a numeric UID that does not exist on the box.
+
+The `.env`, `steam_credentials.json`, and `.mmdb` files persist between updates: none of
+them are in the publish output, so an extract over the directory leaves them alone.
+
+## Verifying a deploy
+
+`systemctl is-active` only proves the process started. Confirm it is actually collecting:
+
+```sql
+SELECT sp.id, sp.timestamp, count(*) AS servers,
+       count(sn.client_required_mod_ids) AS with_mods
+FROM psl_snapshots sp
+JOIN psl_server_snapshots sn ON sn.snapshot_id = sp.id
+GROUP BY sp.id, sp.timestamp ORDER BY sp.id DESC LIMIT 5;
+```
+
+A snapshot with servers but `with_mods = 0` means the preview parse is broken while the
+scan still looks healthy — that exact failure went unnoticed for three months.
 
 ## Troubleshooting
 
