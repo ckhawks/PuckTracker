@@ -54,20 +54,23 @@ Every scan resolves the Workshop IDs servers require into `psl_mods` (title, cre
 `time_updated`, subscriptions, ban status). The cache refreshes every 24 hours, so a
 change to an already-deployed mod is noticed within a day.
 
-Four things raise an alert into `psl_mod_alerts`, delivered to `DISCORD_WEBHOOK_URL`:
+**Only mods listed in `psl_mod_watch` raise alerts.** Servers add and drop mods constantly,
+so alerting on everything buries the handful worth reading. Every mod is still cached and
+tracked in `psl_mods` regardless -- the watchlist gates the alert, not the data.
+
+Five things raise an alert into `psl_mod_alerts`, delivered to `DISCORD_WEBHOOK_URL`:
 
 | Kind | Fires when |
 |---|---|
-| `new-mod` | A Workshop ID never seen on any server before appears |
-| `updated` | A mod already in use is updated on the Workshop |
-| `retitled` | A mod's title changes |
-| `banned` | A mod is banned on the Workshop but servers still require it |
-| `watchlist` | A mod listed in `psl_mod_watch` is live anywhere |
+| `new-mod` | A watched Workshop ID never seen on any server before appears |
+| `updated` | A watched mod already in use is updated on the Workshop |
+| `retitled` | A watched mod's title changes |
+| `banned` | A watched mod is banned on the Workshop but servers still require it |
+| `watchlist` | A watched mod is live anywhere |
 
 `updated` matters most for supply-chain risk: a mod turning hostile in an update, after
 it is already required by dozens of servers, is likelier than a new malicious mod being
-widely adopted. `new-mod` catches what a watchlist cannot, since you cannot list an ID
-you have not seen yet.
+widely adopted.
 
 To watch a specific mod:
 
@@ -76,8 +79,8 @@ INSERT INTO psl_mod_watch (mod_id, reason) VALUES (3776646946, 'why you care');
 ```
 
 Alerts are throttled to one per kind per mod per day. If `DISCORD_WEBHOOK_URL` is unset,
-rows stay `delivered = false` and go out once a webhook is configured. The tables are
-created automatically on startup.
+rows stay `delivered = false` and go out once a webhook is configured. The tables come
+from `nextjs/migrations/023_mod_intel.sql`; this process does not create them.
 
 ## Deployment
 

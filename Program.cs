@@ -504,10 +504,24 @@ async Task ProcessModIntel(NpgsqlDataSource db, List<ServerInfo> servers, DateTi
                 r.GetBoolean(4));
     }
 
+    // Explicit watchlist. Loaded up front because nothing outside it is worth alerting on:
+    // servers add and drop mods constantly, so alerting on every new ID buries the handful
+    // we actually care about. Everything below still updates psl_mods for the site's
+    // history -- only the alert rows are filtered.
+    var watched = new Dictionary<ulong, string>();
+    await using (var cmd = new NpgsqlCommand(
+        "SELECT mod_id, reason FROM psl_mod_watch WHERE mod_id = ANY($1)", conn))
+    {
+        cmd.Parameters.AddWithValue(seen.Select(x => (long)x).ToArray());
+        await using var r = await cmd.ExecuteReaderAsync();
+        while (await r.ReadAsync())
+            watched[(ulong)r.GetInt64(0)] = r.IsDBNull(1) ? "no reason recorded" : r.GetString(1);
+    }
+
     var alerts = new List<(ulong Id, string Kind, string Detail)>();
 
-    // A mod ID nobody has ever deployed before. This is the alert an ID watchlist cannot
-    // give you, because you cannot list an ID you have not seen yet.
+    // A mod ID nobody has ever deployed before, and that we already watch -- someone
+    // deploying a mod we flagged is the whole point of the list.
     foreach (var id in seen.Where(id => !known.ContainsKey(id)))
         alerts.Add((id, "new-mod", $"First appearance, on {usage[id].Count} server(s): {Sample(usage[id])}"));
 
@@ -576,19 +590,8 @@ async Task ProcessModIntel(NpgsqlDataSource db, List<ServerInfo> servers, DateTi
         }
     }
 
-    // Explicit watchlist
-    await using (var cmd = new NpgsqlCommand(
-        "SELECT mod_id, reason FROM psl_mod_watch WHERE mod_id = ANY($1)", conn))
-    {
-        cmd.Parameters.AddWithValue(seen.Select(x => (long)x).ToArray());
-        await using var r = await cmd.ExecuteReaderAsync();
-        while (await r.ReadAsync())
-        {
-            var id = (ulong)r.GetInt64(0);
-            var reason = r.IsDBNull(1) ? "no reason recorded" : r.GetString(1);
-            alerts.Add((id, "watchlist", $"Watched mod is live on {usage[id].Count} server(s) ({reason}): {Sample(usage[id])}"));
-        }
-    }
+    foreach (var (id, reason) in watched)
+        alerts.Add((id, "watchlist", $"Watched mod is live on {usage[id].Count} server(s) ({reason}): {Sample(usage[id])}"));
 
     if (seeding)
     {
@@ -599,7 +602,7 @@ async Task ProcessModIntel(NpgsqlDataSource db, List<ServerInfo> servers, DateTi
     // A watchlisted mod stays live indefinitely, so an un-throttled alert would fire every
     // 15 minutes forever. One per kind per mod per day is enough to stay informed.
     var fired = 0;
-    foreach (var (id, kind, detail) in alerts)
+    foreach (var (id, kind, detail) in alerts.Where(a => watched.ContainsKey(a.Id)))
     {
         await using var cmd = new NpgsqlCommand(@"
             INSERT INTO psl_mod_alerts (mod_id, kind, detail, created_at)
