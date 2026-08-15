@@ -14,9 +14,15 @@
     <PackageReference Include="SteamKit2" Version="3.4.0" />
   </ItemGroup>
 
+  <!--
+    The GeoIP databases are gitignored (76 MB) and live on the deploy target, so a fresh
+    clone does not have them. Copy them only when present: EnrichWithGeoIP already treats
+    a missing database as "no location data" rather than an error, and the deploy excludes
+    the .mmdb files anyway.
+  -->
   <ItemGroup>
-    <None Include="GeoLite2-City.mmdb" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="GeoLite2-ASN.mmdb" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="GeoLite2-City.mmdb" CopyToOutputDirectory="PreserveNewest" Condition="Exists('GeoLite2-City.mmdb')" />
+    <None Include="GeoLite2-ASN.mmdb" CopyToOutputDirectory="PreserveNewest" Condition="Exists('GeoLite2-ASN.mmdb')" />
   </ItemGroup>
 
 </Project>

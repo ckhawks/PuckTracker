@@ -68,17 +68,40 @@ if (ticket == null)
 Console.WriteLine($"[Steam] Got auth ticket ({ticket.Length / 2} bytes)");
 
 // --- Create persistent connections ---
-// Game updated to b1153 — current build on puck2 master (puck1/b897 decommissioned).
+// One connection per build we still track. A Puck update is a hard cutover for
+// players, but the fleet drains over days, so both masters are polled through the
+// migration and the old build is dropped from this list once it goes quiet.
+// The masters alternate between puck1 and puck2 with each build: b323 -> puck2,
+// b897 -> puck1, b1153 -> puck2, b1235 -> puck1.
+//
 // Pass a ticket PROVIDER, not a fixed ticket: Steam auth tickets / master-side
 // sessions expire after a few days, so every (re)auth must mint a FRESH ticket.
 // Otherwise the WebSocket stays "connected" but the master silently stops answering
 // server-list requests until the process is restarted. See Authenticate().
-var b1153Conn = new PersistentConnection("b1153", "wss://puck2.nasejevs.com",
-    () => steamSession.GetAuthTicket(PUCK_APP_ID));
+var connections = new List<PersistentConnection>
+{
+    new PersistentConnection("b1235", "wss://puck1.nasejevs.com",
+        () => steamSession.GetAuthTicket(PUCK_APP_ID)),
+    new PersistentConnection("b1153", "wss://puck2.nasejevs.com",
+        () => steamSession.GetAuthTicket(PUCK_APP_ID)),
+};
 
 Console.WriteLine($"PuckServerTracker started (mode: {(runOnce ? "single scan" : "continuous, every 15 min")})");
+Console.WriteLine($"Tracking builds: {string.Join(", ", connections.Select(c => c.Version))}");
 
-await b1153Conn.EnsureConnected();
+// One master being down must not stop the others from being polled, so a failed
+// connect here is logged and left for the per-scan EnsureConnected to retry.
+foreach (var conn in connections)
+{
+    try
+    {
+        await conn.EnsureConnected();
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[{conn.Version}] Initial connect failed: {ex.Message}");
+    }
+}
 
 // Proactively rebuild the connection well before the master expires the session
 // (~days), so a scan never has to eat the reconnect-on-timeout penalty first.
@@ -93,12 +116,22 @@ try
 
         if (DateTime.UtcNow - lastReconnect >= reconnectEvery)
         {
-            Console.WriteLine($"[b1153] Proactive reconnect (session age >= {reconnectEvery.TotalHours:0}h)...");
-            await b1153Conn.ForceReconnect();
+            foreach (var conn in connections)
+            {
+                Console.WriteLine($"[{conn.Version}] Proactive reconnect (session age >= {reconnectEvery.TotalHours:0}h)...");
+                try
+                {
+                    await conn.ForceReconnect();
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[{conn.Version}] Proactive reconnect failed: {ex.Message}");
+                }
+            }
             lastReconnect = DateTime.UtcNow;
         }
 
-        await Scan(db, b1153Conn);
+        await Scan(db, connections);
 
         if (!runOnce)
         {
@@ -113,7 +146,8 @@ try
 }
 finally
 {
-    await b1153Conn.Disconnect();
+    foreach (var conn in connections)
+        await conn.Disconnect();
     steamSession.Disconnect();
     Console.WriteLine("[Steam] Disconnected.");
 }
@@ -123,18 +157,40 @@ return 0;
 // =============================================================================
 // Scan
 // =============================================================================
-async Task Scan(NpgsqlDataSource db, PersistentConnection b1153)
+async Task Scan(NpgsqlDataSource db, List<PersistentConnection> connections)
 {
     var timestamp = DateTime.UtcNow.ToString("o");
     Console.WriteLine($"\n{"".PadRight(60, '=')}");
     Console.WriteLine($"Scan at {timestamp}");
     Console.WriteLine("".PadRight(60, '='));
 
-    await b1153.EnsureConnected();
+    // Kick every master off before awaiting any of them: the TCP preview sweep is
+    // the slow part of a scan, and one master being unreachable would otherwise add
+    // its full timeout to the others' latency.
+    var requests = new List<(string Version, Task<List<ServerInfo>> Task)>();
 
-    var b1153Task = b1153.RequestServerList("playerGetServerBrowserEndPointsRequest", ParseB323Response);
+    foreach (var conn in connections)
+    {
+        try
+        {
+            await conn.EnsureConnected();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[{conn.Version}] Connect failed, skipping this scan: {ex.Message}");
+            continue;
+        }
 
-    await ProcessResult("b1153", b1153Task, db, timestamp);
+        requests.Add((
+            conn.Version,
+            conn.RequestServerList("playerGetServerBrowserEndPointsRequest", ParseEndpointsResponse(conn.Version))
+        ));
+    }
+
+    // Processed one at a time so the printed table and the snapshot writes for each
+    // build stay contiguous rather than interleaving.
+    foreach (var (version, task) in requests)
+        await ProcessResult(version, task, db, timestamp);
 }
 
 async Task ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlDataSource db, string timestamp)
@@ -156,7 +212,9 @@ async Task ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlData
 // =============================================================================
 // Response Parsers
 // =============================================================================
-async Task<List<ServerInfo>> ParseB323Response(SocketIOResponse response)
+// Every build's master has used the same endpoint-list shape since b323; the version
+// is closed over only so the log lines say which build they belong to.
+Func<SocketIOResponse, Task<List<ServerInfo>>> ParseEndpointsResponse(string version) => async response =>
 {
     var json = response.GetValue<JsonElement>();
     var endpoints = new List<ServerInfo>();
@@ -171,7 +229,7 @@ async Task<List<ServerInfo>> ParseB323Response(SocketIOResponse response)
     { endpointsArray = json; }
     else
     {
-        Console.Error.WriteLine($"[b1153] Unexpected format");
+        Console.Error.WriteLine($"[{version}] Unexpected format");
         return endpoints;
     }
 
@@ -184,11 +242,11 @@ async Task<List<ServerInfo>> ParseB323Response(SocketIOResponse response)
         });
     }
 
-    Console.WriteLine($"[b1153] Fetching TCP previews for {endpoints.Count} endpoints...");
+    Console.WriteLine($"[{version}] Fetching TCP previews for {endpoints.Count} endpoints...");
     await Task.WhenAll(endpoints.Select(TcpPreview));
-    Console.WriteLine($"[b1153] Parsed {endpoints.Count} servers");
+    Console.WriteLine($"[{version}] Parsed {endpoints.Count} servers");
     return endpoints;
-}
+};
 
 async Task TcpPreview(ServerInfo server)
 {

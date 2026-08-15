@@ -6,7 +6,7 @@ No game client or Steam client required - authenticates directly via [SteamKit2]
 
 ## What it tracks
 
-- All public servers on b1153 (current game build)
+- All public servers on b1235 (current game build) and b1153 (previous build, still draining)
 - Player counts, max players, password status
 - Server names (with change history)
 - GeoIP location and ISP (via MaxMind GeoLite2)
@@ -40,13 +40,32 @@ First run prompts for Steam credentials interactively. A refresh token is saved 
 ## How it works
 
 1. Authenticates to Steam via SteamKit2
-2. Connects to `wss://puck2.nasejevs.com` (b1153 master server) via Socket.IO
+2. Connects to one master server per tracked build via Socket.IO — `wss://puck1.nasejevs.com`
+   (b1235) and `wss://puck2.nasejevs.com` (b1153). The masters alternate between puck1 and
+   puck2 with each game build, so a build update means adding the other host, not editing
+   the existing one. A master that is down is skipped for that scan and retried on the next;
+   it does not stall the other builds.
 3. Authenticates with a Steam web API ticket
 4. Requests the endpoint list, then queries each server directly via TCP for the preview payload
 5. Enriches with GeoIP data
 6. Writes to PostgreSQL (`psl_servers`, `psl_server_names`, `psl_snapshots`, `psl_server_snapshots`)
 
 Maintains persistent WebSocket connections and reconnects automatically if dropped.
+
+## When Puck ships a new build
+
+A client update is a hard cutover — players on the new build cannot join servers still on
+the old one — but the server fleet takes days to drain, so both builds are tracked through
+the migration rather than switching over in one step.
+
+1. Find the new build's master: it is in a dedicated server's `Logs/Puck.log`, on the
+   `[WebsocketManager] Creating WebSocket (url: ...)` line.
+2. Add a `PersistentConnection` for it at the top of the `connections` list in `Program.cs`.
+3. Once the old build's scans stop returning servers worth keeping, delete its entry.
+
+The frontend needs no change: `/api/server-list` picks the latest snapshot per version and
+only counts versions scanned within the last hour, so a build stops appearing on its own
+once it is removed here.
 
 ## Mod alerts
 
