@@ -68,17 +68,29 @@ if (ticket == null)
 Console.WriteLine($"[Steam] Got auth ticket ({ticket.Length / 2} bytes)");
 
 // --- Create persistent connections ---
-// Game updated to b1153 — current build on puck2 master (puck1/b897 decommissioned).
 // Pass a ticket PROVIDER, not a fixed ticket: Steam auth tickets / master-side
 // sessions expire after a few days, so every (re)auth must mint a FRESH ticket.
 // Otherwise the WebSocket stays "connected" but the master silently stops answering
 // server-list requests until the process is restarted. See Authenticate().
-var b1153Conn = new PersistentConnection("b1153", "wss://puck2.nasejevs.com",
-    () => steamSession.GetAuthTicket(PUCK_APP_ID));
+//
+// nasejevs alternates the live master between puck1 and puck2 on every game build and
+// decommissions the outgoing host, so both are kept here and each scan uses whichever
+// still answers. Hardcoding the current one turns every rotation into an outage.
+//
+// The build label is metadata only — nothing in the protocol reports it (the master
+// returns bare ip/port, the TCP preview carries no version field) — so it is mapped per
+// host here and bumped by hand when a build ships. A stale label never stops a scan.
+var masters = new[]
+{
+    new PersistentConnection("b1235", "wss://puck1.nasejevs.com",
+        () => steamSession.GetAuthTicket(PUCK_APP_ID)),
+    new PersistentConnection("b1153", "wss://puck2.nasejevs.com",
+        () => steamSession.GetAuthTicket(PUCK_APP_ID)),
+};
 
 Console.WriteLine($"PuckServerTracker started (mode: {(runOnce ? "single scan" : "continuous, every 15 min")})");
 
-await b1153Conn.EnsureConnected();
+await Task.WhenAll(masters.Select(m => m.EnsureConnected()));
 
 // Proactively rebuild the connection well before the master expires the session
 // (~days), so a scan never has to eat the reconnect-on-timeout penalty first.
@@ -93,12 +105,15 @@ try
 
         if (DateTime.UtcNow - lastReconnect >= reconnectEvery)
         {
-            Console.WriteLine($"[b1153] Proactive reconnect (session age >= {reconnectEvery.TotalHours:0}h)...");
-            await b1153Conn.ForceReconnect();
+            foreach (var m in masters)
+            {
+                Console.WriteLine($"[{m.Version}] Proactive reconnect (session age >= {reconnectEvery.TotalHours:0}h)...");
+                await m.ForceReconnect();
+            }
             lastReconnect = DateTime.UtcNow;
         }
 
-        await Scan(db, b1153Conn);
+        await Scan(db, masters);
 
         if (!runOnce)
         {
@@ -113,7 +128,7 @@ try
 }
 finally
 {
-    await b1153Conn.Disconnect();
+    foreach (var m in masters) await m.Disconnect();
     steamSession.Disconnect();
     Console.WriteLine("[Steam] Disconnected.");
 }
@@ -123,18 +138,31 @@ return 0;
 // =============================================================================
 // Scan
 // =============================================================================
-async Task Scan(NpgsqlDataSource db, PersistentConnection b1153)
+async Task Scan(NpgsqlDataSource db, PersistentConnection[] masters)
 {
     var timestamp = DateTime.UtcNow.ToString("o");
     Console.WriteLine($"\n{"".PadRight(60, '=')}");
     Console.WriteLine($"Scan at {timestamp}");
     Console.WriteLine("".PadRight(60, '='));
 
-    await b1153.EnsureConnected();
+    // Scanned independently: a master that is down — or has just been decommissioned by a
+    // rotation — must cost only its own results, never the other host and never the loop.
+    await Task.WhenAll(masters.Select(m => ScanMaster(db, m, timestamp)));
+}
 
-    var b1153Task = b1153.RequestServerList("playerGetServerBrowserEndPointsRequest", ParseB323Response);
+async Task ScanMaster(NpgsqlDataSource db, PersistentConnection master, string timestamp)
+{
+    await master.EnsureConnected();
+    if (!master.IsConnected)
+    {
+        Console.WriteLine($"[{master.Version}] Master not answering, skipped this scan");
+        return;
+    }
 
-    await ProcessResult("b1153", b1153Task, db, timestamp);
+    var task = master.RequestServerList("playerGetServerBrowserEndPointsRequest",
+        response => ParseEndpointsResponse(master.Version, response));
+
+    await ProcessResult(master.Version, task, db, timestamp);
 }
 
 async Task ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlDataSource db, string timestamp)
@@ -156,7 +184,7 @@ async Task ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlData
 // =============================================================================
 // Response Parsers
 // =============================================================================
-async Task<List<ServerInfo>> ParseB323Response(SocketIOResponse response)
+async Task<List<ServerInfo>> ParseEndpointsResponse(string version, SocketIOResponse response)
 {
     var json = response.GetValue<JsonElement>();
     var endpoints = new List<ServerInfo>();
@@ -171,7 +199,7 @@ async Task<List<ServerInfo>> ParseB323Response(SocketIOResponse response)
     { endpointsArray = json; }
     else
     {
-        Console.Error.WriteLine($"[b1153] Unexpected format");
+        Console.Error.WriteLine($"[{version}] Unexpected format");
         return endpoints;
     }
 
@@ -184,9 +212,9 @@ async Task<List<ServerInfo>> ParseB323Response(SocketIOResponse response)
         });
     }
 
-    Console.WriteLine($"[b1153] Fetching TCP previews for {endpoints.Count} endpoints...");
+    Console.WriteLine($"[{version}] Fetching TCP previews for {endpoints.Count} endpoints...");
     await Task.WhenAll(endpoints.Select(TcpPreview));
-    Console.WriteLine($"[b1153] Parsed {endpoints.Count} servers");
+    Console.WriteLine($"[{version}] Parsed {endpoints.Count} servers");
     return endpoints;
 }
 
@@ -1086,6 +1114,21 @@ class PersistentConnection
     private bool _authenticated;
     private readonly SemaphoreSlim _connectLock = new(1, 1);
 
+    // SocketIOClient 3.1.1's ConnectAsync() takes no CancellationToken, and with
+    // Reconnection enabled it retries a dead host forever. Nothing below is awaited
+    // without a ceiling, or one decommissioned master freezes every scan (it did:
+    // 28 hours of no data, process alive at 0% CPU with every thread parked).
+    private static readonly TimeSpan ConnectCeiling = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DisconnectCeiling = TimeSpan.FromSeconds(5);
+
+    // Same expired-certificate bypass the websocket needs, see InsecureClientWebSocket.
+    private static readonly HttpClient _probeHttp = new(
+        new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = (msg, cert, chain, errors) => true
+        })
+    { Timeout = TimeSpan.FromSeconds(8) };
+
     public bool IsConnected => _socket?.Connected == true && _authenticated;
 
     public PersistentConnection(string version, string url, Func<Task<string?>> ticketProvider)
@@ -1104,12 +1147,16 @@ class PersistentConnection
         {
             if (IsConnected) return;
 
-            if (_socket != null)
+            await Teardown();
+
+            // A decommissioned master still resolves in DNS and can still accept TCP, so
+            // "connect and see" is not safe here -- ConnectAsync would retry it forever
+            // while holding _connectLock, stalling this scan and every one after it.
+            // Probe the handshake first, with a real timeout, and skip the host instead.
+            if (!await IsReachable())
             {
-                try { await _socket.DisconnectAsync(); } catch { }
-                _socket.Dispose();
-                _socket = null;
                 _authenticated = false;
+                return;
             }
 
             _socket = new SioClient(_url, new SocketIOOptions
@@ -1152,7 +1199,16 @@ class PersistentConnection
 
             try
             {
-                await _socket.ConnectAsync();
+                // Belt and braces behind the probe: a host that passes the handshake can
+                // still stall the websocket upgrade, and that must not become permanent.
+                var connect = _socket.ConnectAsync();
+                if (await Task.WhenAny(connect, Task.Delay(ConnectCeiling)) != connect)
+                {
+                    Console.Error.WriteLine($"[{Version}] Connect exceeded {ConnectCeiling.TotalSeconds:0}s, abandoning this attempt");
+                    await Teardown();
+                    return;
+                }
+                await connect;
                 Console.WriteLine($"[{Version}] Connected to {_url}");
                 await Authenticate();
             }
@@ -1164,6 +1220,40 @@ class PersistentConnection
         finally
         {
             _connectLock.Release();
+        }
+    }
+
+    // Disposing is what actually stops the library's internal reconnect loop, and it must
+    // happen even when DisconnectAsync hangs against a host that stopped answering.
+    private async Task Teardown()
+    {
+        if (_socket == null) return;
+        try
+        {
+            var disconnect = _socket.DisconnectAsync();
+            await Task.WhenAny(disconnect, Task.Delay(DisconnectCeiling));
+        }
+        catch { }
+        try { _socket.Dispose(); } catch { }
+        _socket = null;
+        _authenticated = false;
+    }
+
+    // A live master answers the socket.io polling handshake with 0{"sid":"..."}; a
+    // decommissioned one refuses the connection or never replies.
+    private async Task<bool> IsReachable()
+    {
+        var probeUrl = _url.Replace("wss://", "https://").Replace("ws://", "http://").TrimEnd('/')
+            + "/socket.io/?EIO=4&transport=polling";
+        try
+        {
+            using var resp = await _probeHttp.GetAsync(probeUrl);
+            return (await resp.Content.ReadAsStringAsync()).Contains("\"sid\"");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[{Version}] Master {_url} not answering: {ex.GetType().Name}");
+            return false;
         }
     }
 
@@ -1207,13 +1297,7 @@ class PersistentConnection
         await _connectLock.WaitAsync();
         try
         {
-            if (_socket != null)
-            {
-                try { await _socket.DisconnectAsync(); } catch { }
-                _socket.Dispose();
-                _socket = null;
-            }
-            _authenticated = false;
+            await Teardown();
         }
         finally
         {
