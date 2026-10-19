@@ -8,6 +8,7 @@ using SioClient = SocketIOClient.SocketIO;
 
 const uint PUCK_APP_ID = 2994020;
 const int POLL_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+const int MAX_EMPTY_SCANS = 3; // ~45 min with no servers from any master -> exit for systemd to restart
 // Workshop metadata is cached rather than re-fetched every 15 minutes, but the cache is
 // deliberately short: a title change on a mod that is already deployed across dozens of
 // servers is exactly the signal we want to catch, so staleness here costs detection time.
@@ -97,6 +98,13 @@ await Task.WhenAll(masters.Select(m => m.EnsureConnected()));
 var lastReconnect = DateTime.UtcNow;
 var reconnectEvery = TimeSpan.FromHours(12);
 
+// Reconnecting the socket does not rebuild the Steam login, and a process that has run for
+// days can end up where no reconnect helps: the master kicks every auth, or the probe never
+// sees a handshake, while a fresh process works on its first try (2026-10-18, 33 h of no data).
+// So after enough empty scans in a row, exit and let systemd's Restart=always start clean.
+var emptyScans = 0;
+var exitCode = 0;
+
 try
 {
     do
@@ -113,7 +121,14 @@ try
             lastReconnect = DateTime.UtcNow;
         }
 
-        await Scan(db, masters);
+        var found = await Scan(db, masters);
+        emptyScans = found > 0 ? 0 : emptyScans + 1;
+        if (!runOnce && emptyScans >= MAX_EMPTY_SCANS)
+        {
+            Console.Error.WriteLine($"No servers from any master for {emptyScans} scans in a row, exiting so systemd restarts with a fresh Steam session");
+            exitCode = 1;
+            break;
+        }
 
         if (!runOnce)
         {
@@ -133,12 +148,12 @@ finally
     Console.WriteLine("[Steam] Disconnected.");
 }
 
-return 0;
+return exitCode;
 
 // =============================================================================
 // Scan
 // =============================================================================
-async Task Scan(NpgsqlDataSource db, PersistentConnection[] masters)
+async Task<int> Scan(NpgsqlDataSource db, PersistentConnection[] masters)
 {
     var timestamp = DateTime.UtcNow.ToString("o");
     Console.WriteLine($"\n{"".PadRight(60, '=')}");
@@ -147,29 +162,33 @@ async Task Scan(NpgsqlDataSource db, PersistentConnection[] masters)
 
     // Scanned independently: a master that is down — or has just been decommissioned by a
     // rotation — must cost only its own results, never the other host and never the loop.
-    await Task.WhenAll(masters.Select(m => ScanMaster(db, m, timestamp)));
+    var counts = await Task.WhenAll(masters.Select(m => ScanMaster(db, m, timestamp)));
+    return counts.Sum();
 }
 
-async Task ScanMaster(NpgsqlDataSource db, PersistentConnection master, string timestamp)
+async Task<int> ScanMaster(NpgsqlDataSource db, PersistentConnection master, string timestamp)
 {
     await master.EnsureConnected();
     if (!master.IsConnected)
     {
         Console.WriteLine($"[{master.Version}] Master not answering, skipped this scan");
-        return;
+        return 0;
     }
 
     var task = master.RequestServerList("playerGetServerBrowserEndPointsRequest",
         response => ParseEndpointsResponse(master.Version, response));
 
-    await ProcessResult(master.Version, task, db, timestamp);
+    return await ProcessResult(master.Version, task, db, timestamp);
 }
 
-async Task ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlDataSource db, string timestamp)
+// Returns how many servers the master listed, even if saving them failed afterwards.
+async Task<int> ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlDataSource db, string timestamp)
 {
+    var count = 0;
     try
     {
         var servers = await task;
+        count = servers.Count;
         EnrichWithGeoIP(servers);
         PrintServers(version, servers);
         await SaveSnapshot(db, version, servers, timestamp);
@@ -179,6 +198,7 @@ async Task ProcessResult(string version, Task<List<ServerInfo>> task, NpgsqlData
     {
         Console.Error.WriteLine($"[{version}] Failed: {ex.Message}");
     }
+    return count;
 }
 
 // =============================================================================
@@ -1248,7 +1268,13 @@ class PersistentConnection
         try
         {
             using var resp = await _probeHttp.GetAsync(probeUrl);
-            return (await resp.Content.ReadAsStringAsync()).Contains("\"sid\"");
+            var body = await resp.Content.ReadAsStringAsync();
+            if (body.Contains("\"sid\"")) return true;
+
+            // Answered, but not with a handshake. Log what it said, or "not answering" is all we get.
+            var snippet = body.Length > 200 ? body[..200] : body;
+            Console.Error.WriteLine($"[{Version}] Master {_url} answered without a handshake: HTTP {(int)resp.StatusCode} {snippet}");
+            return false;
         }
         catch (Exception ex)
         {
@@ -1361,12 +1387,11 @@ class PersistentConnection
 
     public async Task Disconnect()
     {
+        // Bounded via Teardown: this runs on the exit-for-restart path, and an unbounded
+        // DisconnectAsync against a wedged socket would keep systemd from ever restarting us.
         if (_socket != null)
         {
-            try { if (_socket.Connected) await _socket.DisconnectAsync(); } catch { }
-            _socket.Dispose();
-            _socket = null;
-            _authenticated = false;
+            await Teardown();
             Console.WriteLine($"[{Version}] Disconnected.");
         }
     }
